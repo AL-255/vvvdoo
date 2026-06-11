@@ -1,0 +1,11 @@
+build/
+*.o
+*.a
+obj_dir/
+*.fst
+*.vcd
+*.ppm
+!tb/traces/golden/*.ppm
+*.bin
+tb/traces/*.vvt
+.deps/

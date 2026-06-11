@@ -1,0 +1,10 @@
+`verilator_config
+// JUSTIFICATION: voodoo_pkg.sv is READ-ONLY contract-level code (CONTRACTS §6),
+// so its warnings cannot be waived inline by agents. Verilator 5.x flags
+// UNUSEDSIGNAL on function-local variables inside the pkg helper functions
+// (dith_rb/dith_g 'int t' high bits; pack565 ignores the low bits of r/g/b BY
+// DESIGN — straight 888->565 truncation). The waiver is scoped to exactly
+// those lines of that one file; it cannot mask warnings anywhere else.
+// NOTE for integrator: the Makefile lint/sim targets glob only rtl/*.sv, so
+// this file must be added there (or 2 inline lint_off pragmas in the pkg).
+lint_off -rule UNUSEDSIGNAL -file "*voodoo_pkg.sv" -lines 144-163
