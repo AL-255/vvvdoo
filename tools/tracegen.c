@@ -1318,6 +1318,154 @@ static void gen_m4(const char *dir)
     end_trace(dir, "m4_pipeline");
 }
 
+/* ---------------- m5: per-texture-format perspective walls -------------- */
+/* GLQuake gameplay surfaced a divergence on PERSPECTIVE-textured walls that
+ * the m1-m4 synthetic traces miss: m3 only ever exercises fmt 10 (RGB565,
+ * bpt2).  GLQuake's world textures are predominantly fmt 3 (I8, bpt1 —
+ * lightmaps), fmt 1 (NCC/paletted, bpt1), and fmt 12 (ARGB4444, bpt2).  m5
+ * downloads a small mipmapped texture in EACH of those formats and draws a
+ * steep perspective-correct textured wall (float-reg path, 256/iterw divide,
+ * bilinear + mipmapping enabled), exactly like a Quake wall.  fmt 10 is the
+ * known-good control. */
+
+#define H_M5 480.0
+
+/* fill one texel value for level `dim` at (s,t), per format. bpt1 -> 1 byte,
+ * bpt2 -> 2 bytes.  Deterministic, mip-self-consistent (8x8 cells). */
+static uint32_t m5_texel(int fmt, int s, int t, int dim)
+{
+    int cw = dim / 8; if (cw < 1) cw = 1;
+    int cell = ((s / cw) ^ (t / cw)) & 1;
+    /* a smooth-ish gradient on top of the checker so bilinear/mip differences
+     * actually move the result (a flat checker hides sub-LSB blend errors) */
+    int grad = ((s * 7 + t * 3) & 0xff);
+    switch (fmt) {
+    case 3:   /* I8 intensity (bpt1) */
+        return (uint32_t)((cell ? 200 : 40) ^ (grad >> 2)) & 0xff;
+    case 1:   /* NCC / paletted (bpt1) — gold expands via grayscale pal565 */
+        return (uint32_t)((cell ? 0xC0 : 0x30) + (grad >> 3)) & 0xff;
+    case 12: { /* ARGB4444 (bpt2) */
+        int a = cell ? 0xf : 0x8;
+        int r = (grad >> 4) & 0xf;
+        int gg = cell ? 0xe : 0x3;
+        int b = (s + t) & 0xf;
+        return (uint32_t)((a << 12) | (r << 8) | (gg << 4) | b);
+    }
+    case 10: default: { /* RGB565 (bpt2) control */
+        int r = cell ? 230 : 30, g = cell ? 140 : 180, b = cell ? 30 : 120;
+        return to565(r, g, b);
+    }
+    }
+}
+
+/* download a 64x64 (LOD2) mip chain LOD2..LOD8 for `fmt` at texBaseAddr `base8`
+ * (base in 8-byte units), through the real tex_write dword path.  bpt2 packs 2
+ * texels/dword (ts advances 2 bytes); bpt1 packs 4 texels/dword (ts advances 2
+ * bytes per dword, each write spans 4 bytes — so step the col field by 2 to
+ * cover 4 fresh texels and let the hw's `&~3` alignment tile them).  This is
+ * the exact GLQuake non-seq8 layout the simpler tests never drive. */
+static void m5_download(int fmt, uint32_t base8)
+{
+    int bpt = (fmt < 8) ? 1 : 2;
+    regw(REG_textureMode, (uint32_t)fmt << 8);
+    regw(REG_tLOD, (8u << 0) | (32u << 6));        /* lod_min=LOD2, lod_max=LOD8 */
+    regw(REG_texBaseAddr, base8);
+    for (int lod = 2; lod <= 8; lod++) {
+        int dim = (0xff >> lod) + 1;               /* 64,32,16,8,4,2,1 */
+        for (int tt = 0; tt < dim; tt++) {
+            if (bpt == 2) {
+                for (int col = 0; col < (dim + 1) / 2; col++) {
+                    uint32_t lo = m5_texel(fmt, 2 * col + 0, tt, dim);
+                    uint32_t hi = m5_texel(fmt, 2 * col + 1, tt, dim);
+                    uint32_t dwoff = ((uint32_t)lod << 15) | ((uint32_t)tt << 7) |
+                                     (uint32_t)col;
+                    wr(0x800000u + (dwoff << 2), lo | (hi << 16), 0xffffffffu);
+                }
+            } else {
+                /* 4 texels/dword; col field = 2*c4 -> ts = 4*c4 (see tex_write) */
+                for (int c4 = 0; c4 < (dim + 3) / 4; c4++) {
+                    uint32_t d = 0;
+                    for (int k = 0; k < 4; k++)
+                        d |= (m5_texel(fmt, 4 * c4 + k, tt, dim) & 0xff) << (8 * k);
+                    uint32_t col = (uint32_t)(2 * c4);
+                    uint32_t dwoff = ((uint32_t)lod << 15) | ((uint32_t)tt << 7) | col;
+                    wr(0x800000u + (dwoff << 2), d, 0xffffffffu);
+                }
+            }
+        }
+    }
+}
+
+/* one steep perspective-correct textured wall, float-reg path. (x0,x1) is the
+ * on-screen horizontal band; the wall recedes from near (w=1, bottom) to far
+ * (w=8, top), tiled, like a GLQuake wall. */
+static void m5_wall(int fmt, uint32_t base8, double x0, double x1)
+{
+    /* combine: texel passes through (zero_other + add c_local); persp + tex en;
+     * bilinear min/mag enabled (tm bits 1,2) for mipmapped bilinear like Quake */
+    regw(REG_texBaseAddr, base8);
+    regw(REG_fbzColorPath, (1u << 0) | (1u << 2) | (1u << 27));
+    regw(REG_textureMode,
+         ((uint32_t)fmt << 8) | (1u << 0) | (1u << 1) | (1u << 2) |
+         (1u << 12) | (1u << 18) | (1u << 21) | (1u << 27));
+
+    double ny = H_M5 * 0.97, fy = H_M5 * 0.30;     /* steep: near bottom, far top */
+    double midn = (x0 + x1) * 0.5, midf = (x0 + x1) * 0.5;
+    double halfn = (x1 - x0) * 0.5, halff = halfn * 0.25;
+    double nl_x = midn - halfn, nr_x = midn + halfn;
+    double fl_x = midf - halff, fr_x = midf + halff;
+    double qn = 1.0, qf = 1.0 / 8.0;               /* steep W range (1..8) */
+    double uacross = 4.0 * 256.0, vdepth = 24.0 * 256.0;
+    tvtx_t nl = fv(nl_x, ny, 255, 255, 255, 255, 0x4000);
+    nl.s = 0;            nl.t = 0;           nl.q = qn;
+    tvtx_t nr = fv(nr_x, ny, 255, 255, 255, 255, 0x4000);
+    nr.s = uacross * qn; nr.t = 0;           nr.q = qn;
+    tvtx_t fl = fv(fl_x, fy, 255, 255, 255, 255, 0x4000);
+    fl.s = 0;            fl.t = vdepth * qf; fl.q = qf;
+    tvtx_t fr = fv(fr_x, fy, 255, 255, 255, 255, 0x4000);
+    fr.s = uacross * qf; fr.t = vdepth * qf; fr.q = qf;
+    tri_submit(&nl, &nr, &fl, T_FLOAT | T_STWQ);
+    tri_submit(&nr, &fr, &fl, T_FLOAT | T_STWQ);
+}
+
+static void gen_m5(const char *dir)
+{
+    const int   fmts[4]   = { 3, 1, 12, 10 };      /* I8, NCC, ARGB4444, RGB565 */
+    const uint32_t bases[4] = { 0x0000u, 0x4000u, 0x8000u, 0xc000u }; /* 8B units */
+
+    begin_trace();
+    common_init();
+
+    regw(REG_fbzMode, FBZ_BASE);
+    regw(REG_alphaMode, 0);
+    regw(REG_fbzColorPath, 0);
+    regw(REG_textureMode, 0);
+
+    /* clear to dark blue, depth far */
+    regw(REG_color1, 0x00203060);
+    regw(REG_zaColor, 0x0000ffff);
+    regw(REG_fastfillCMD, 0);
+
+    /* download all four textures up front */
+    mark(0x5100);
+    for (int i = 0; i < 4; i++)
+        m5_download(fmts[i], bases[i]);
+
+    /* draw four side-by-side perspective walls, one per format */
+    for (int i = 0; i < 4; i++) {
+        mark(0x5200 + (uint32_t)i);
+        double x0 = 640.0 * (0.02 + 0.245 * i);
+        double x1 = 640.0 * (0.02 + 0.245 * i + 0.235);
+        m5_wall(fmts[i], bases[i], x0, x1);
+    }
+
+    mark(0x5f00);
+    regw(REG_swapbufferCMD, 0);
+    rd_nocmp(0);
+
+    end_trace(dir, "m5_texfmt");
+}
+
 /* ---------------- main -------------------------------------------------- */
 
 int main(int argc, char **argv)
@@ -1335,6 +1483,7 @@ int main(int argc, char **argv)
     gen_m2(dir);
     gen_m3(dir);
     gen_m4(dir);
+    gen_m5(dir);
 
     if (G)
         vgold_destroy(G);

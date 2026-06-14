@@ -170,6 +170,7 @@ module tmu
   logic [7:0]  sfrac_q, tfrac_q;
   logic [7:0]  cs_ss, cs_s1, cs_tt, cs_t1;
   logic [1:0]  corner_q;
+  logic        cs_unused;   // lint sink for s1/t1 upper bits (see S_LODCALC)
 
   logic [7:0] e_a [4], e_r [4], e_g [4], e_b [4];
   logic [15:0] raw_w;
@@ -412,7 +413,7 @@ module tmu
       ilod_q <= '0; texbase_q <= '0; smax_q <= '0; tmax_q <= '0; point_q <= 1'b0;
       sfrac_q <= '0; tfrac_q <= '0;
       cs_ss <= '0; cs_s1 <= '0; cs_tt <= '0; cs_t1 <= '0;
-      corner_q <= '0; comb_q <= '0; raw_w <= '0;
+      corner_q <= '0; comb_q <= '0; raw_w <= '0; cs_unused <= 1'b0;
       e_a <= '{default:'0}; e_r <= '{default:'0};
       e_g <= '{default:'0}; e_b <= '{default:'0};
     end else begin
@@ -547,8 +548,13 @@ module tmu
               cs_tt <= 8'(tt) & lc_tmax;
               cs_t1 <= 8'(t1) & lc_tmax;
               // s1/t1 upper bits only feed the (already-evaluated) clamp/mask;
-              // reference them so lint sees the full width as consumed.
-              if (&{s1[31:8], t1[31:8]}) cs_ss <= cs_ss;
+              // sink them so lint sees the full width as consumed.  (Must NOT
+              // be a conditional self-assignment to cs_ss: that issues a second
+              // non-blocking write that overrides the correct value with the
+              // stale one whenever s1[31:8] & t1[31:8] are all ones — i.e. for
+              // small negative texel coords, which corrupted the bilinear base
+              // corner on perspective walls.)
+              cs_unused <= |{s1[31:8], t1[31:8]};
             end
             state_q <= S_ADDR;
           end
@@ -605,7 +611,7 @@ module tmu
   // unused sink — tri_params fields not consumed by the TMU, the upper
   // texBaseAddr bits (only [18:0] matter), and a few derived bits.
   logic unused;
-  assign unused = &{1'b0, texbaseaddr[31:19], texbase_lo_q, ilod_q, tmax_q,
+  assign unused = &{1'b0, cs_unused, texbaseaddr[31:19], texbase_lo_q, ilod_q, tmax_q,
                     tp_q.ax, tp_q.ay, tp_q.bx, tp_q.by, tp_q.cx, tp_q.cy,
                     tp_q.sign,
                     tp_q.startr, tp_q.startg, tp_q.startb, tp_q.starta,
