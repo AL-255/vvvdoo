@@ -1,5 +1,16 @@
 # vvvdoo triangle rasterization rule (normative)
 
+> **UPDATE 2 (float, MAME byte-exact):** the rule is now MAME's exact
+> FLOATING-POINT poly raster: float verts (`coord/16.0`), stable Y-sort,
+> `real`/double edge slopes, per-scanline `startx`/`stopx` at `curscan+0.5`,
+> `round_coordinate` (ties .5 down) both edges, winding-agnostic swap,
+> exclusive `[lo,hi)`. Perspective/LOD reverted to MAME double
+> (`256.0/w`, `fast_log2` on the IEEE double bits). gold (C `double`) and RTL
+> (Verilator `real`) share IEEE-754 so they are byte-identical; the `real`
+> raster/TMU front-end is simulation-only (the integer pixel pipeline stays
+> synthesizable). Iterator origin is MAME floor `ax>>4`. Subpixel adjust uses
+> MAME's signed `8-(ax&15)` form (in cmd_dispatch).
+>
 > **UPDATE (MAME-match):** the rule below described the 86Box edge-walk
 > (sign-bit-driven, `+0x7000` bias, `-0x10000` trailing pullback, inclusive
 > span). It has been **superseded** by MAME's `poly.h` rule to make the RTL

@@ -78,62 +78,29 @@ module tmu
     return t[m];
   endfunction
 
-  // clz of a nonzero 128-bit value
-  function automatic int clz128f(input logic [127:0] v);
-    int n;
-    n = 128;
-    for (int i = 127; i >= 0; i--)
-      if (v[i]) begin n = 127 - i; break; end
-    return n;
-  endfunction
-
-  // fast_log2_i64(v, fracbits): returns signed 24.8. v treated as signed.
-  function automatic logic signed [31:0] fast_log2_i64f(input logic signed [63:0] v,
-                                                        input int fracbits);
-    logic [63:0]        n;
-    int                 p;
-    logic [6:0]         m7;
+  // fast_log2(real value, int fracbits) — bit-exact mirror of gold fast_log2:
+  //   union{double;u64} -> ival = bits>>45; exp = (ival>>7)-1023-fracbits;
+  //   return (exp<<8) | s_log2_table[ival&127]; value<0 -> 0.
+  // Uses $realtobits for the IEEE-754 double bit pattern (== C union punning).
+  // `real` is sim-only (behavioral); accepted trade for bit-exact float match.
+  function automatic logic signed [31:0] fast_log2f(input real value,
+                                                    input int fracbits);
+    // JUSTIFICATION: only the top 19 bits of the IEEE-754 double pattern matter
+    // (sign+exponent+top-7 mantissa, gold's bits>>45); the low 45 mantissa bits
+    // are intentionally discarded, exactly like gold's (uint32_t)(temp.i>>45).
+    /* verilator lint_off UNUSEDSIGNAL */
+    logic [63:0]        bits64;
+    /* verilator lint_on UNUSEDSIGNAL */
+    logic [18:0]        ival;     // (u64 bits) >> 45
     logic signed [23:0] expv;
-    if (v < 0)
+    if (value < 0.0)
       return 32'sd0;
-    if (v == 0)
-      return $signed(32'(-(1023 + fracbits)) <<< 8);
-    n = v;
-    p = 0;
-    for (int i = 63; i >= 0; i--)
-      if (n[i]) begin p = i; break; end
-    if (p >= 7)
-      m7 = 7'((n >> (p - 7)) & 64'd127);
-    else
-      m7 = 7'((n << (7 - p)) & 64'd127);
-    expv = 24'(p - fracbits);
-    return $signed({expv, 8'd0} | {24'd0, log2tab(m7)});
-  endfunction
-
-  // fast_log2_u128(v, 64)
-  function automatic logic signed [31:0] fast_log2_u128f(input logic [127:0] v);
-    int                 p;
-    logic [127:0]       sh;
-    logic [6:0]         m7;
-    logic signed [23:0] expv;
-    if (v == 0)
-      return $signed(32'(-(1023 + 64)) <<< 8);
-    p = 127 - clz128f(v);
-    if (p >= 7)
-      m7 = 7'((v >> (p - 7)) & 128'd127);
-    else begin
-      sh = v << (7 - p);
-      m7 = 7'(sh & 128'd127);
-    end
-    expv = 24'(p - 64);
-    return $signed({expv, 8'd0} | {24'd0, log2tab(m7)});
-  endfunction
-
-  // square of a signed 64-bit value into 128 bits (non-negative)
-  function automatic logic [127:0] sq128(input logic signed [63:0] a);
-    logic signed [127:0] p;
-    p = $signed({{64{a[63]}}, a}) * $signed({{64{a[63]}}, a});
-    return p;
+    bits64 = $realtobits(value);
+    ival = bits64[63:45];
+    // exp = (ival >> 7) - 1023 - fracbits  (ival>>7 is the 12-bit {sign,exp});
+    // truncated to 24 bits, matching gold's (uint32_t)exp << 8 | table low bits
+    expv = 24'($signed({20'd0, ival[18:7]}) - 32'sd1023 - 32'(fracbits));
+    return $signed({expv, 8'd0} | {24'd0, log2tab(ival[6:0])});
   endfunction
 
   // ================================================================
@@ -480,13 +447,20 @@ module tmu
           end
 
           S_LODBASE: begin
-            logic [127:0] sx, sy, mx;
+            // compute_lodbase (gold): texdx = (double)dsdx^2 + (double)dtdx^2,
+            // texdy similarly; return fast_log2(max(texdx,texdy), 64) / 2.
+            // Same operand order/grouping as gold for bit-exact float match.
+            real fdsdx, fdsdy, fdtdx, fdtdy, texdx, texdy, maxval;
             logic signed [31:0] l2;
-            sx = sq128(tp_q.ds0dx) + sq128(tp_q.dt0dx);
-            sy = sq128(tp_q.ds0dy) + sq128(tp_q.dt0dy);
-            mx = (sx > sy) ? sx : sy;
-            l2 = fast_log2_u128f(mx);
-            lodbase_q <= (l2 < 0) ? -((-l2) >>> 1) : (l2 >>> 1);  // C /2 trunc->0
+            fdsdx = real'($signed(tp_q.ds0dx));
+            fdsdy = real'($signed(tp_q.ds0dy));
+            fdtdx = real'($signed(tp_q.dt0dx));
+            fdtdy = real'($signed(tp_q.dt0dy));
+            texdx = fdsdx * fdsdx + fdtdx * fdtdx;
+            texdy = fdsdy * fdsdy + fdtdy * fdtdy;
+            maxval = (texdx > texdy) ? texdx : texdy;
+            l2 = fast_log2f(maxval, 64);
+            lodbase_q <= l2 / 32'sd2;   // C int /2 truncates toward zero
             state_q <= S_RDY;
           end
 
@@ -500,22 +474,26 @@ module tmu
           end
 
           S_DIV: begin
+            // FLOAT perspective/affine, bit-exact mirror of gold fetch_texel.
+            // iters/itert/iterw = (double)(int64_t)iterator; iterw==0 -> 1.0
+            // (substituted at the gold call site, so clampnegw sees it too).
+            // `real` is sim-only (behavioral); accepted trade for float match.
+            real iters, itert, iterw, recip;
+            iters = real'($signed(s0_q));
+            itert = real'($signed(t0_q));
+            iterw = real'($signed(w0_q));
+            if (iterw == 0.0) iterw = 1.0;
             if (tp_q.texmode[0]) begin
-              logic signed [63:0]  w, wd;
-              logic signed [127:0] ns, nt;
-              w  = (w0_q == 0) ? 64'sd1 : w0_q;
-              wd = w;
-              ns = $signed({{64{s0_q[63]}}, s0_q}) * 128'sd256;
-              nt = $signed({{64{t0_q[63]}}, t0_q}) * 128'sd256;
-              coord_s_q   <= 32'(ns / $signed({{64{wd[63]}}, wd}));
-              coord_t_q   <= 32'(nt / $signed({{64{wd[63]}}, wd}));
-              lod_persp_q <= -fast_log2_i64f(w0_q, 32);
+              recip       = 256.0 / iterw;
+              coord_s_q   <= $rtoi(iters * recip);
+              coord_t_q   <= $rtoi(itert * recip);
+              lod_persp_q <= -fast_log2f(iterw, 32);
             end else begin
-              coord_s_q   <= 32'(s0_q >>> 24);
-              coord_t_q   <= 32'(t0_q >>> 24);
+              coord_s_q   <= $rtoi(iters * (1.0 / real'(32'sd1 <<< 24)));
+              coord_t_q   <= $rtoi(itert * (1.0 / real'(32'sd1 <<< 24)));
               lod_persp_q <= 32'sd0;
             end
-            negw_q  <= (w0_q < 0);
+            negw_q  <= (iterw < 0.0);
             state_q <= S_LODCALC;
           end
 

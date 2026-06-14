@@ -1,33 +1,41 @@
-// raster.sv — [raster agent] triangle walker (CONTRACTS §5/§7.2, M2).
+// raster.sv — [raster agent] triangle walker (CONTRACTS §5/§7.2, M2/M3).
 //
-// Implements the NORMATIVE integer edge-walk of docs/raster-algorithm.md
-// bit-for-bit against model/voodoo_gold.c raster_triangle():
-//   - edge slopes: trunc32((sext64(dx)<<16)/dy), 0 when dy==0 (C trunc-toward-
-//     zero semantics; gold edge_slope(), 86box vid_voodoo_render.c
-//     voodoo_triangle() 1446-1596) — one shared sequential restoring divider.
-//   - ystart0=(Ay+7)>>>4, yend0=(Cy+7)>>>4 (excl), pA=(Ax+7)>>>4; y-clip to
-//     the effective clip rect (raster-algorithm.md §2, CONTRACTS §9.9).
-//   - per row: ys=(y<<4)+8; xMaj on AC, xMin on AB while ys<By else BC; the
-//     products dxEdge*(ys-Vy) are taken full-width then >>>4 and the sums are
-//     truncated to 32 bits; -0x10000 pullback on the trailing (right) edge
-//     only; both ends rounded with +0x7000 then >>>16; X-clip; inclusive walk
-//     from xMaj in the sign-determined direction (raster-algorithm.md §4).
-//   - iterators (r,g,b,a,z mod 2^32; w,s0,t0,w0 mod 2^64): incremental row/
-//     pixel accumulators that are bit-identical to the absolute formula
-//     P(x,y)=startP+(x-pA)*dPdX+(y-ystart0)*dPdY of raster-algorithm.md §3
-//     (two's-complement wrap makes repeated addition equal multiplication).
+// FLOAT coverage port: mirrors model/voodoo_gold.c raster_triangle() bit-for-
+// bit using Verilator `real` (IEEE-754 double == C double). The triangle
+// coverage (which scanlines, and the [left,right) span on each) now follows
+// MAME's floating-point poly rule exactly:
+//   - float verts vx = real'(coord) * (1.0/16.0) from the 12.4 s16 coords;
+//   - stable sort the 3 (vx,vy) by vy ascending into (v1,v2,v3);
+//   - edge slopes dxdy13/dxdy12/dxdy23 = (dx)/(dy) in `real` (0.0 if dy==0);
+//   - iy1/iy3 = round_coordinate(v1y/v3y), y-clipped to [ct,cb);
+//   - per scanline curscan: fully = curscan+0.5; startx on the long edge
+//     v1->v3, stopx on v1->v2 (fully<v2y) else v2->v3; round_coordinate both
+//     (ties .5 round DOWN), swap so left<=right, clip to [cl,cr), EXCLUSIVE
+//     right, draw [left,right).
+//   - round_coordinate(v): f=$floor(v); $rtoi(f) + ((v-f)>0.5 ? 1 : 0).
 //
-// Pixel emission uses a 1-deep hold stage so that px_last can be asserted on
-// the true final pixel (the walker only releases a held pixel once a younger
-// one exists, or at end-of-triangle with px_last=1).
+// `real` is SIMULATION-ONLY (not synthesizable). This is the accepted trade
+// for bit-exactness with the float golden model; the coverage math here is a
+// behavioral model, while the per-pixel INTEGER iterator accumulators (rowp/
+// pixp, mod 2^32 / 2^64) are unchanged and synthesizable.
 //
-// Zero-pixel triangles: the §7.2 wiring has no dedicated "no pixels" signal
-// and cmd_dispatch waits for pixel_pipe's tri_done, so a triangle that covers
-// nothing emits ONE dummy beat with px_last=1 and (px_x,px_y)=(1023,1023),
-// which is provably outside any reachable clip rect (clip_right/bottom are
-// 10-bit exclusive bounds, so a real pixel never has x or y == 1023); the
-// pixel pipe discards out-of-clip-rect pixels without side effects and still
-// pulses tri_done. Flagged in the integration report.
+// The iterator ORIGIN is now the ORIGINAL vertex A, arithmetic-floored:
+//   ox = $signed(ax) >>> 4, oy = $signed(ay) >>> 4
+// matching gold's ox=asr32(ax,4), oy=asr32(ay,4). The per-pixel value
+//   P(x,y) = startP + (x-ox)*dPdX + (y-oy)*dPdY
+// is built incrementally (row accumulator seeded at curscan, pixel accumulator
+// seeded at left); two's-complement wrap makes repeated addition equal the
+// absolute multiply form gold uses.
+//
+// The triangleCMD sign bit is IGNORED (winding handled by the start/stop swap),
+// matching gold. Subpixel start adjustment (fbzcp bit26) is applied upstream in
+// cmd_dispatch before launch.
+//
+// Zero-pixel triangles: the §7.2 wiring has no dedicated "no pixels" signal and
+// cmd_dispatch waits for pixel_pipe's tri_done, so a triangle covering nothing
+// emits ONE dummy beat with px_last=1 and (px_x,px_y)=(1023,1023), provably
+// outside any reachable clip rect; the pixel pipe discards it and still pulses
+// tri_done.
 module raster
   import voodoo_pkg::*;
 (
@@ -56,22 +64,25 @@ module raster
     output logic signed [63:0] px_w0
 );
 
+  // round_coordinate(v): MAME poly.h round-to-nearest, ties (.5) round DOWN.
+  // f=$floor(v); $rtoi(f) is exact for integer-valued reals.
+  function automatic int round_coordinate(input real v);
+    real f;
+    f = $floor(v);
+    return $rtoi(f) + (((v - f) > 0.5) ? 1 : 0);
+  endfunction
+
   // ----------------------------------------------------------------
   // FSM
   // ----------------------------------------------------------------
   typedef enum logic [3:0] {
     R_IDLE,       // wait for tri_valid
-    R_DIV_INIT,   // load divider for edge div_idx (or skip if dy==0)
-    R_DIV_RUN,    // 32 restoring-division iterations
-    R_DIV_STORE,  // sign-correct and store slope
-    R_SETUP,      // ystart/yend/pA; bail if no rows
-    R_ROWINIT,    // rowP[ch] = startP[ch] + (ystart-ystart0)*dPdY[ch]
-    R_XMAJ,       // xmaj for current row (shared multiplier)
-    R_XMIN,       // xmin for current row (shared multiplier)
-    R_SPAN,       // round/pullback/clip/empty-test
-    R_SPANINIT,   // pixP[ch] = rowP[ch] + (first-pA)*dPdX[ch]
-    R_WALK,       // emit pixels first..last inclusive
-    R_NEXTROW,    // y++, rowP += dPdY
+    R_SETUP,      // compute float coverage scalars; bail if no rows
+    R_ROWINIT,    // rowP[ch] = startP[ch] + (curscan-oy)*dPdY
+    R_SPAN,       // float startx/stopx -> [left,right); empty test
+    R_SPANINIT,   // pixP[ch] = rowP[ch] + (left-ox)*dPdX
+    R_WALK,       // emit pixels left..right-1 inclusive
+    R_NEXTROW,    // curscan++, rowP += dPdY
     R_FLUSH,      // release held final pixel (px_last=1) or dummy beat
     R_DRAIN       // wait for the last beat to be accepted
   } rstate_e;
@@ -93,127 +104,70 @@ module raster
   logic signed [63:0] ch_dy    [9];
 
   // ----------------------------------------------------------------
-  // shared sequential divider (slope = trunc32((sext64(dx)<<16)/dy))
-  // gold edge_slope(); C trunc-toward-zero = floor on magnitudes with the
-  // result negated when operand signs differ (division here is exact).
+  // FLOAT coverage scalars (sim-only `real`). Latched at R_SETUP from the
+  // sorted float verts; used combinationally per scanline.
   // ----------------------------------------------------------------
-  logic [1:0]  div_idx_q;          // 0=AB, 1=AC, 2=BC
-  logic        div_neg_q;
-  logic [31:0] div_dvd_q;          // |dx| << 16 (|dx| <= 65535)
-  logic [15:0] div_dvs_q;          // |dy|       (|dy| <= 65535, != 0)
-  logic [15:0] div_rem_q;
-  logic [31:0] div_quot_q;
-  logic [5:0]  div_cnt_q;
-
-  logic signed [31:0] dxab_q, dxac_q, dxbc_q;
-
-  logic signed [16:0] div_num, div_den;
-  always_comb begin
-    unique case (div_idx_q)
-      2'd0:    begin div_num = 17'({bx_q[15], bx_q}) - 17'({ax_q[15], ax_q});
-                     div_den = 17'({by_q[15], by_q}) - 17'({ay_q[15], ay_q}); end
-      2'd1:    begin div_num = 17'({cx_q[15], cx_q}) - 17'({ax_q[15], ax_q});
-                     div_den = 17'({cy_q[15], cy_q}) - 17'({ay_q[15], ay_q}); end
-      default: begin div_num = 17'({cx_q[15], cx_q}) - 17'({bx_q[15], bx_q});
-                     div_den = 17'({cy_q[15], cy_q}) - 17'({by_q[15], by_q}); end
-    endcase
-  end
-
-  // |v| of a 17-bit signed difference of two s16 values (range +/-65535, so
-  // the magnitude always fits 16 bits and 16-bit negation is exact)
-  function automatic logic [15:0] mag17(input logic signed [16:0] v);
-    return v[16] ? (16'h0000 - v[15:0]) : v[15:0];
-  endfunction
-
-  // one restoring-division step (16-bit remainder is enough: rem < |dy|)
-  logic [16:0] div_trial;
-  logic        div_qbit;
-  always_comb begin
-    div_trial = {div_rem_q, div_dvd_q[31]};
-    div_qbit  = (div_trial >= {1'b0, div_dvs_q});
-  end
+  // v1,v2 needed per-scanline; v3 only feeds the (precomputed) slopes.
+  real v1x_q, v1y_q, v2x_q, v2y_q;
+  real dxdy13_q, dxdy12_q, dxdy23_q;
 
   // ----------------------------------------------------------------
   // setup / per-row scalars (32-bit signed working registers)
   // ----------------------------------------------------------------
-  logic signed [31:0] pa_q;
-  logic signed [31:0] yend_q;
-  logic signed [31:0] y_q;
-  logic signed [31:0] dy0_q, dx0_q;
+  logic signed [31:0] ox_q;           // iterator x-origin = floor(ax/16)
+  logic signed [31:0] yend_q;         // iy3 (clipped), exclusive
+  logic signed [31:0] y_q;            // current curscan
+  logic signed [31:0] dy0_q, dx0_q;   // (curscan-oy), (left-ox)
   logic signed [31:0] first_q, last_q;
   logic signed [31:0] x_q;
-  logic [31:0]        xmaj_q, xmin_q;
   logic [3:0]         ch_q;
 
-  // setup combinational values (raster-algorithm.md §2)
-  logic signed [31:0] ystart0_c, yend0_c, ystart_c, yend_c;
+  // 32-bit clip values
   logic signed [31:0] cl32, cr32, ct32, cb32;
   always_comb begin
     cl32 = $signed({22'b0, cl_q});
     cr32 = $signed({22'b0, cr_q});
     ct32 = $signed({22'b0, ct_q});
     cb32 = $signed({22'b0, cb_q});
-    ystart0_c = (32'(ay_q) + 32'sd7) >>> 4;
-    yend0_c   = (32'(cy_q) + 32'sd7) >>> 4;
-    ystart_c  = (ystart0_c > ct32) ? ystart0_c : ct32;
-    yend_c    = (yend0_c < cb32) ? yend0_c : cb32;
   end
 
-  // row center in 12.4 (raster-algorithm.md §4)
-  logic signed [31:0] ys_c;
-  assign ys_c = (y_q <<< 4) + 32'sd8;
-
-  // minor edge select: AB while ys < By, else BC (ties use BC)
-  logic minor_is_ab;
-  assign minor_is_ab = (ys_c < 32'(by_q));
-
   // ----------------------------------------------------------------
-  // shared 64x64->64 multiplier (mod-2^64 product)
+  // shared 64x64->64 multiplier (mod-2^64 product) for the integer
+  // iterator seeding: rowP and pixP origins.
   // ----------------------------------------------------------------
   logic signed [63:0] mul_a, mul_b, mul_p;
   always_comb begin
     unique case (state_q)
-      R_ROWINIT: begin mul_a = ch_dy[ch_q]; mul_b = 64'(dy0_q); end
-      R_XMAJ:    begin mul_a = 64'(dxac_q); mul_b = 64'(ys_c - 32'(ay_q)); end
-      R_XMIN: begin
-        if (minor_is_ab) begin
-          mul_a = 64'(dxab_q); mul_b = 64'(ys_c - 32'(ay_q));
-        end else begin
-          mul_a = 64'(dxbc_q); mul_b = 64'(ys_c - 32'(by_q));
-        end
-      end
+      R_ROWINIT:  begin mul_a = ch_dy[ch_q]; mul_b = 64'(dy0_q); end
       R_SPANINIT: begin mul_a = ch_dx[ch_q]; mul_b = 64'(dx0_q); end
       default:    begin mul_a = '0; mul_b = '0; end
     endcase
   end
   assign mul_p = mul_a * mul_b;   // SV: 64-bit operands -> mod-2^64 product
 
-  // edge intercept: (Vx<<12) + asr4(slope * (ys - Vy)), truncated to 32 bits
-  // (gold raster_triangle, raster-algorithm.md §4: 49-bit product, >>>4)
-  logic [31:0] edge_base, edge_acc;
-  always_comb begin
-    edge_base = (state_q == R_XMIN && !minor_is_ab)
-              ? (32'(bx_q) <<< 12)
-              : (32'(ax_q) <<< 12);
-    edge_acc  = edge_base + 32'((mul_p >>> 4));
-  end
-
-  // span endpoints — MAME poly rule (winding-agnostic): round both edge X to
-  // nearest (+0x7fff, ties down) -> integer pixels, swap so lo<=hi, draw
-  // [lo,hi) EXCLUSIVE, then clip. The triangleCMD sign bit is IGNORED (MAME
-  // computes winding itself). first_c=lo, last_c=hi-1 (inclusive walk forward).
-  logic signed [31:0] sx_c, ex_c, lo_c, hi_c, first_c, last_c;
+  // ----------------------------------------------------------------
+  // per-scanline float span (combinational, gold raster_triangle loop body)
+  // ----------------------------------------------------------------
+  real fully_c, startx_c, stopx_c;
+  int  istartx_c, istopx_c, ilo_c, ihi_c;
+  logic signed [31:0] first_c, last_c;
   logic               empty_c;
   always_comb begin
-    sx_c = $signed(xmaj_q + 32'h0000_7fff) >>> 16;
-    ex_c = $signed(xmin_q + 32'h0000_7fff) >>> 16;
-    lo_c = (sx_c < ex_c) ? sx_c : ex_c;
-    hi_c = (sx_c < ex_c) ? ex_c : sx_c;
-    if (lo_c < cl32) lo_c = cl32;
-    if (hi_c > cr32) hi_c = cr32;
-    first_c = lo_c;
-    last_c  = hi_c - 32'sd1;
-    empty_c = (lo_c >= hi_c);
+    fully_c  = real'(y_q) + 0.5;
+    startx_c = v1x_q + (fully_c - v1y_q) * dxdy13_q;
+    stopx_c  = (fully_c < v2y_q) ? (v1x_q + (fully_c - v1y_q) * dxdy12_q)
+                                 : (v2x_q + (fully_c - v2y_q) * dxdy23_q);
+    istartx_c = round_coordinate(startx_c);
+    istopx_c  = round_coordinate(stopx_c);
+    // swap so lo<=hi (winding-agnostic)
+    ilo_c = (istartx_c > istopx_c) ? istopx_c : istartx_c;
+    ihi_c = (istartx_c > istopx_c) ? istartx_c : istopx_c;
+    // clip to [cl, cr); right EXCLUSIVE
+    if ($signed(ilo_c) < cl32) ilo_c = cl32;
+    if ($signed(ihi_c) > cr32) ihi_c = cr32;
+    first_c = $signed(ilo_c);
+    last_c  = $signed(ihi_c) - 32'sd1;     // inclusive walk forward
+    empty_c = ($signed(ilo_c) >= $signed(ihi_c));
   end
 
   // ----------------------------------------------------------------
@@ -244,18 +198,11 @@ module raster
       ax_q <= '0; ay_q <= '0; bx_q <= '0; by_q <= '0; cx_q <= '0; cy_q <= '0;
       sign_q       <= 1'b0;
       cl_q <= '0; cr_q <= '0; ct_q <= '0; cb_q <= '0;
-      div_idx_q    <= '0;
-      div_neg_q    <= 1'b0;
-      div_dvd_q    <= '0;
-      div_dvs_q    <= '0;
-      div_rem_q    <= '0;
-      div_quot_q   <= '0;
-      div_cnt_q    <= '0;
-      dxab_q <= '0; dxac_q <= '0; dxbc_q <= '0;
-      pa_q <= '0; yend_q <= '0;
+      v1x_q <= 0.0; v1y_q <= 0.0; v2x_q <= 0.0; v2y_q <= 0.0;
+      dxdy13_q <= 0.0; dxdy12_q <= 0.0; dxdy23_q <= 0.0;
+      ox_q <= '0; yend_q <= '0;
       y_q <= '0; dy0_q <= '0; dx0_q <= '0;
       first_q <= '0; last_q <= '0; x_q <= '0;
-      xmaj_q <= '0; xmin_q <= '0;
       ch_q         <= '0;
       hold_valid_q <= 1'b0;
       hold_x_q     <= '0;
@@ -321,111 +268,102 @@ module raster
             ch_dy[7] <= tri_params.dt0dy;
             ch_dy[8] <= tri_params.dw0dy;
             hold_valid_q <= 1'b0;
-            div_idx_q    <= 2'd0;
-            state_q      <= R_DIV_INIT;
+            state_q      <= R_SETUP;
           end
         end
 
         // ------------------------------------------------------------
-        R_DIV_INIT: begin
-          if (div_den == 17'sd0) begin
-            // dy == 0 -> slope 0 (gold edge_slope)
-            unique case (div_idx_q)
-              2'd0:    dxab_q <= 32'sd0;
-              2'd1:    dxac_q <= 32'sd0;
-              default: dxbc_q <= 32'sd0;
-            endcase
-            if (div_idx_q == 2'd2)
-              state_q <= R_SETUP;
-            else
-              div_idx_q <= div_idx_q + 2'd1;
-          end else begin
-            div_neg_q  <= div_num[16] ^ div_den[16];
-            div_dvd_q  <= {mag17(div_num), 16'b0};
-            div_dvs_q  <= mag17(div_den);
-            div_rem_q  <= '0;
-            div_quot_q <= '0;
-            div_cnt_q  <= 6'd32;
-            state_q    <= R_DIV_RUN;
-          end
-        end
-
-        R_DIV_RUN: begin
-          if (div_qbit)
-            div_rem_q <= 16'(div_trial - {1'b0, div_dvs_q});
-          else
-            div_rem_q <= div_trial[15:0];
-          div_quot_q <= {div_quot_q[30:0], div_qbit};
-          div_dvd_q  <= {div_dvd_q[30:0], 1'b0};
-          div_cnt_q  <= div_cnt_q - 6'd1;
-          if (div_cnt_q == 6'd1)
-            state_q <= R_DIV_STORE;
-        end
-
-        R_DIV_STORE: begin
-          // negate the magnitude quotient if operand signs differed; the
-          // 32-bit wrap equals C's trunc32 of the signed 64-bit quotient
-          unique case (div_idx_q)
-            2'd0:    dxab_q <= $signed(div_neg_q ? (32'h0 - div_quot_q) : div_quot_q);
-            2'd1:    dxac_q <= $signed(div_neg_q ? (32'h0 - div_quot_q) : div_quot_q);
-            default: dxbc_q <= $signed(div_neg_q ? (32'h0 - div_quot_q) : div_quot_q);
-          endcase
-          if (div_idx_q == 2'd2)
-            state_q <= R_SETUP;
-          else begin
-            div_idx_q <= div_idx_q + 2'd1;
-            state_q   <= R_DIV_INIT;
-          end
-        end
-
-        // ------------------------------------------------------------
+        // R_SETUP: build float verts, stable-sort by vy ascending, compute
+        // edge slopes, iy1/iy3, origin floor; seed the scanline loop.
         R_SETUP: begin
-          yend_q    <= yend_c;
-          pa_q      <= (32'(ax_q) + 32'sd7) >>> 4;
-          y_q       <= ystart_c;
-          dy0_q     <= ystart_c - ystart0_c;
-          ch_q      <= 4'd0;
-          if (ystart_c >= yend_c)
+          // float verts from 12.4 coords (/16) — same expressions as gold
+          real ax_f, ay_f, bx_f, by_f, cx_f, cy_f;
+          real s1x, s1y, s2x, s2y, s3x, s3y;   // sorted v1,v2,v3
+          real t;
+          real d13, d12, d23;
+          int  iy1, iy3;
+          ax_f = real'($signed(ax_q)) * (1.0 / 16.0);
+          ay_f = real'($signed(ay_q)) * (1.0 / 16.0);
+          bx_f = real'($signed(bx_q)) * (1.0 / 16.0);
+          by_f = real'($signed(by_q)) * (1.0 / 16.0);
+          cx_f = real'($signed(cx_q)) * (1.0 / 16.0);
+          cy_f = real'($signed(cy_q)) * (1.0 / 16.0);
+          // vv[0]=A, vv[1]=B, vv[2]=C
+          s1x = ax_f; s1y = ay_f;
+          s2x = bx_f; s2y = by_f;
+          s3x = cx_f; s3y = cy_f;
+          // stable sort of 3 by y ascending (gold's exact 3 compares):
+          //   if (vv[1].y < vv[0].y) swap(vv[0],vv[1]);
+          //   if (vv[2].y < vv[1].y) swap(vv[1],vv[2]);
+          //   if (vv[1].y < vv[0].y) swap(vv[0],vv[1]);
+          if (s2y < s1y) begin
+            t = s1x; s1x = s2x; s2x = t;
+            t = s1y; s1y = s2y; s2y = t;
+          end
+          if (s3y < s2y) begin
+            t = s2x; s2x = s3x; s3x = t;
+            t = s2y; s2y = s3y; s3y = t;
+          end
+          if (s2y < s1y) begin
+            t = s1x; s1x = s2x; s2x = t;
+            t = s1y; s1y = s2y; s2y = t;
+          end
+          v1x_q <= s1x; v1y_q <= s1y;
+          v2x_q <= s2x; v2y_q <= s2y;
+
+          d13 = (s3y != s1y) ? (s3x - s1x) / (s3y - s1y) : 0.0;
+          d12 = (s2y != s1y) ? (s2x - s1x) / (s2y - s1y) : 0.0;
+          d23 = (s3y != s2y) ? (s3x - s2x) / (s3y - s2y) : 0.0;
+          dxdy13_q <= d13;
+          dxdy12_q <= d12;
+          dxdy23_q <= d23;
+
+          // iterator origin = ORIGINAL vertex A, arithmetic floor (gold asr32)
+          ox_q <= 32'($signed(ax_q)) >>> 4;
+
+          // iy1=round(v1y), iy3=round(v3y), clip y to [ct, cb)
+          iy1 = round_coordinate(s1y);
+          iy3 = round_coordinate(s3y);
+          if (iy1 < $signed(ct32)) iy1 = $signed(ct32);
+          if (iy3 > $signed(cb32)) iy3 = $signed(cb32);
+
+          y_q    <= iy1;
+          yend_q <= iy3;
+          ch_q   <= 4'd0;
+          if (iy1 >= iy3)
             state_q <= R_FLUSH;          // no candidate rows at all
-          else
+          else begin
+            // seed dy0 = curscan - oy for the first scanline's R_ROWINIT
+            dy0_q   <= iy1 - (32'($signed(ay_q)) >>> 4);
             state_q <= R_ROWINIT;
+          end
         end
 
         R_ROWINIT: begin
-          // rowP = startP + (ystart-ystart0)*dPdY  (mod 2^32 / 2^64)
+          // rowP = startP + (curscan-oy)*dPdY  (mod 2^32 / 2^64)
           rowp[ch_q] <= ch_start[ch_q] + mul_p;
           if (ch_q == 4'd8) begin
             ch_q    <= 4'd0;
-            state_q <= R_XMAJ;
+            state_q <= R_SPAN;
           end else
             ch_q <= ch_q + 4'd1;
         end
 
         // ------------------------------------------------------------
-        R_XMAJ: begin
-          xmaj_q  <= edge_acc;
-          state_q <= R_XMIN;
-        end
-
-        R_XMIN: begin
-          xmin_q  <= edge_acc;
-          state_q <= R_SPAN;
-        end
-
         R_SPAN: begin
           if (empty_c)
             state_q <= R_NEXTROW;
           else begin
             first_q <= first_c;
             last_q  <= last_c;
-            dx0_q   <= first_c - pa_q;
+            dx0_q   <= first_c - ox_q;
             ch_q    <= 4'd0;
             state_q <= R_SPANINIT;
           end
         end
 
         R_SPANINIT: begin
-          // pixP = rowP + (first-pA)*dPdX  (mod 2^32 / 2^64)
+          // pixP = rowP + (left-ox)*dPdX  (mod 2^32 / 2^64)
           pixp[ch_q] <= rowp[ch_q] + mul_p;
           if (ch_q == 4'd8) begin
             ch_q    <= 4'd0;
@@ -473,11 +411,11 @@ module raster
         R_NEXTROW: begin
           for (int i = 0; i < 9; i++)
             rowp[i] <= rowp[i] + ch_dy[i];
-          y_q <= y_q + 32'sd1;
+          y_q   <= y_q + 32'sd1;
           if (y_q + 32'sd1 >= yend_q)
             state_q <= R_FLUSH;
           else
-            state_q <= R_XMAJ;
+            state_q <= R_SPAN;
         end
 
         // ------------------------------------------------------------

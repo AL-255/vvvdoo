@@ -20,6 +20,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 
 /* ================================================================== */
 /*  small helpers                                                      */
@@ -629,77 +630,50 @@ static const uint8_t s_log2_table[128] = {
     232, 233, 235, 236, 238, 239, 241, 242, 244, 245, 247, 248, 250, 251, 253, 254
 };
 
-/* Integer fast_log2 (24.8 fixed). For an integer value reinterpreted as an
- * IEEE-754 double, the exponent and top-7 mantissa bits are exactly the CLZ
- * normalization of the integer, so this is BIT-EXACT to the old double-bit
- * version (mame_voodoo_render.cpp:165) yet fully reproducible in RTL.
- *  - negative input  -> 0          (matches the `value < 0` guard)
- *  - zero input      -> (-(1023+fracbits)) << 8  (matches double 0.0 bits)
- */
-static int32_t fast_log2_i64(int64_t v, int fracbits)
+/* fast_log2 (24.8 fixed) — MAME's IEEE-754-double-bit form
+ * (mame_voodoo_render.cpp:165). Reads the double's exponent (11 bits) and top
+ * 7 mantissa bits; this is the FLOAT spec the RTL mirrors with Verilator
+ * `real`. Negative values return 0 (sign already 0 by guard). */
+static int32_t fast_log2(double value, int fracbits)
 {
-    if (v < 0)
+    if (value < 0)
         return 0;
-    if (v == 0)
-        return (int32_t)((uint32_t)(-(1023 + fracbits)) << 8);
-    uint64_t n = (uint64_t)v;
-    int p = 63 - __builtin_clzll(n);             /* MSB position */
-    int m7 = (p >= 7) ? (int)((n >> (p - 7)) & 127)
-                      : (int)((n << (7 - p)) & 127);
-    int32_t exp = p - fracbits;
-    return (int32_t)(((uint32_t)exp << 8) | s_log2_table[m7]);
+    union { double d; uint64_t i; } temp;
+    temp.d = value;
+    uint32_t ival = (uint32_t)(temp.i >> 45);
+    int32_t exp = (int32_t)(ival >> 7) - 1023 - fracbits;
+    return (int32_t)(((uint32_t)exp << 8) | s_log2_table[ival & 127]);
 }
 
-/* 128-bit CLZ (value != 0). */
-static int clz128(unsigned __int128 v)
-{
-    uint64_t hi = (uint64_t)(v >> 64);
-    return hi ? __builtin_clzll(hi) : 64 + __builtin_clzll((uint64_t)v);
-}
-
-/* fast_log2 of a non-negative 128-bit value (used for the sum-of-squares LOD
- * gradient). Exact integer form of fast_log2((double)maxval, fracbits): only
- * the exponent + top 7 mantissa bits are consumed, so this matches the old
- * double computation while avoiding the float round-trip. */
-static int32_t fast_log2_u128(unsigned __int128 v, int fracbits)
-{
-    if (v == 0)
-        return (int32_t)((uint32_t)(-(1023 + fracbits)) << 8);
-    int p = 127 - clz128(v);
-    int m7 = (p >= 7) ? (int)((v >> (p - 7)) & 127)
-                      : (int)((v << (7 - p)) & 127);
-    int32_t exp = p - fracbits;
-    return (int32_t)(((uint32_t)exp << 8) | s_log2_table[m7]);
-}
-
-/* base LOD from the texture-coordinate gradients (exact 128-bit integer). */
+/* base LOD from the texture-coordinate gradients (MAME double form). The
+ * iterators are .32, so squares are .64; fast_log2(.,64)/2 = log of sqrt. */
 static int32_t compute_lodbase(int64_t dsdx, int64_t dsdy, int64_t dtdx, int64_t dtdy)
 {
-    unsigned __int128 sx = (unsigned __int128)((__int128)dsdx * dsdx)
-                         + (unsigned __int128)((__int128)dtdx * dtdx);
-    unsigned __int128 sy = (unsigned __int128)((__int128)dsdy * dsdy)
-                         + (unsigned __int128)((__int128)dtdy * dtdy);
-    unsigned __int128 maxval = sx > sy ? sx : sy;
-    return fast_log2_u128(maxval, 64) / 2;
+    double fdsdx = (double)dsdx, fdsdy = (double)dsdy;
+    double fdtdx = (double)dtdx, fdtdy = (double)dtdy;
+    double texdx = fdsdx * fdsdx + fdtdx * fdtdx;
+    double texdy = fdsdy * fdsdy + fdtdy * fdtdy;
+    double maxval = texdx > texdy ? texdx : texdy;
+    return fast_log2(maxval, 64) / 2;
 }
 
-/* fetch a filtered texel (voodoo_soft fetch_texel). Integer perspective:
- * s = trunc((S*256)/W), t = trunc((T*256)/W) — an exact divide, replacing the
- * float `iters * (256.0/iterw)`. Affine: s = trunc(S / 2^24). Both truncate
- * toward zero (C integer division) matching the original (int32) float cast. */
+/* fetch a filtered texel (MAME rasterizer_texture::fetch_texel, render.cpp:916).
+ * Perspective/affine use DOUBLE math exactly as MAME — this is the FLOAT spec
+ * the RTL mirrors with Verilator `real`. The iterators are passed as doubles
+ * cast from the int64 accumulators at the call site. */
 static argb_t fetch_texel(const vgold_t *g, uint32_t tmode,
-                          int64_t iters, int64_t itert, int64_t iterw, int lodbase)
+                          double iters, double itert, double iterw, int lodbase)
 {
     int32_t s, t, lod = lodbase;
 
     if (TM_persp(tmode)) {
-        int64_t w = (iterw == 0) ? 1 : iterw;
-        s = (int32_t)(((__int128)iters * 256) / w);
-        t = (int32_t)(((__int128)itert * 256) / w);
-        lod -= fast_log2_i64(iterw, 32);
+        double recip = 256.0 / iterw;
+        s = (int32_t)(iters * recip);
+        t = (int32_t)(itert * recip);
+        lod -= fast_log2(iterw, 32);
     } else {
-        s = (int32_t)(iters / (1 << 24));
-        t = (int32_t)(itert / (1 << 24));
+        s = (int32_t)(iters * (1.0 / (double)(1 << 24)));
+        t = (int32_t)(itert * (1.0 / (double)(1 << 24)));
     }
     if (TM_clampnegw(tmode) && iterw < 0)
         s = t = 0;
@@ -1108,8 +1082,11 @@ static void pixel_pipe(vgold_t *g, pipectx_t *c, int x, int y,
 
     argb_t texel = { 255, 255, 255, 255 };
     if (c->texturing) {
-        argb_t raw = fetch_texel(g, c->tm, (int64_t)us0, (int64_t)ut0,
-                                 (int64_t)uw0, c->lodbase);
+        double diters = (double)(int64_t)us0;
+        double ditert = (double)(int64_t)ut0;
+        double diterw = (double)(int64_t)uw0;
+        if (diterw == 0) diterw = 1;
+        argb_t raw = fetch_texel(g, c->tm, diters, ditert, diterw, c->lodbase);
         argb_t zero = { 0, 0, 0, 0 };
         texel = combine_generic(c->ctex, zero, raw, raw.a, 0);
     }
@@ -1153,11 +1130,12 @@ static void pixel_pipe(vgold_t *g, pipectx_t *c, int x, int y,
 /*  triangle rasterizer — docs/raster-algorithm.md (NORMATIVE)         */
 /* ================================================================== */
 
-static int32_t edge_slope(int dx_sub, int dy_sub)
+/* MAME poly.h round_coordinate: round-to-nearest, ties (.5 exactly) round
+ * DOWN (floor). This is the FLOAT coverage rule the RTL mirrors in `real`. */
+static int32_t round_coordinate(double v)
 {
-    if (dy_sub == 0)
-        return 0;
-    return (int32_t)(shl64((int64_t)dx_sub, 16) / (int64_t)dy_sub);
+    double f = floor(v);
+    return (int32_t)f + ((v - f) > 0.5 ? 1 : 0);
 }
 
 static void raster_triangle(vgold_t *g, uint32_t sign)
@@ -1233,65 +1211,77 @@ static void raster_triangle(vgold_t *g, uint32_t sign)
     uint64_t t0 = (uint64_t)g->t0_startt, dt0dx = (uint64_t)g->t0_dt_dx, dt0dy = (uint64_t)g->t0_dt_dy;
     uint64_t w0 = (uint64_t)g->t0_startw, dw0dx = (uint64_t)g->t0_dw_dx, dw0dy = (uint64_t)g->t0_dw_dy;
 
-    /* subpixel start-value adjustment (fbzColorPath bit 26) — 86Box mod-16 */
+    /* subpixel start-value adjustment (fbzColorPath bit 26) — MAME signed form:
+     * dxs = 8 - (ax & 15), dys = 8 - (ay & 15) (range -7..8), then
+     * startP += (dxs*dPdX + dys*dPdY) >> 4 (arithmetic), full width mod 2^N. */
     if (CP_subpixel(c.cp)) {
-        uint32_t fx = (uint32_t)(ax & 15), fy = (uint32_t)(ay & 15);
-        uint32_t dxs = 8u - fx; if (fx > 8) dxs += 16;
-        uint32_t dys = 8u - fy; if (fy > 8) dys += 16;
-        sr += (uint32_t)asr32((int32_t)(dxs * drdx + dys * drdy), 4);
-        sg += (uint32_t)asr32((int32_t)(dxs * dgdx + dys * dgdy), 4);
-        sb += (uint32_t)asr32((int32_t)(dxs * dbdx + dys * dbdy), 4);
-        sa += (uint32_t)asr32((int32_t)(dxs * dadx + dys * dady), 4);
-        sz += (uint32_t)asr32((int32_t)(dxs * dzdx + dys * dzdy), 4);
-        sw += (uint64_t)asr64((int64_t)((uint64_t)dxs * dwdx + (uint64_t)dys * dwdy), 4);
-        s0 += (uint64_t)asr64((int64_t)((uint64_t)dxs * ds0dx + (uint64_t)dys * ds0dy), 4);
-        t0 += (uint64_t)asr64((int64_t)((uint64_t)dxs * dt0dx + (uint64_t)dys * dt0dy), 4);
-        w0 += (uint64_t)asr64((int64_t)((uint64_t)dxs * dw0dx + (uint64_t)dys * dw0dy), 4);
+        int32_t dxs = 8 - (ax & 15);
+        int32_t dys = 8 - (ay & 15);
+        sr += (uint32_t)asr32((int32_t)(dxs * (int32_t)drdx + dys * (int32_t)drdy), 4);
+        sg += (uint32_t)asr32((int32_t)(dxs * (int32_t)dgdx + dys * (int32_t)dgdy), 4);
+        sb += (uint32_t)asr32((int32_t)(dxs * (int32_t)dbdx + dys * (int32_t)dbdy), 4);
+        sa += (uint32_t)asr32((int32_t)(dxs * (int32_t)dadx + dys * (int32_t)dady), 4);
+        sz += (uint32_t)asr32((int32_t)(dxs * (int32_t)dzdx + dys * (int32_t)dzdy), 4);
+        sw += (uint64_t)asr64((int64_t)dxs * (int64_t)dwdx + (int64_t)dys * (int64_t)dwdy, 4);
+        s0 += (uint64_t)asr64((int64_t)dxs * (int64_t)ds0dx + (int64_t)dys * (int64_t)ds0dy, 4);
+        t0 += (uint64_t)asr64((int64_t)dxs * (int64_t)dt0dx + (int64_t)dys * (int64_t)dt0dy, 4);
+        w0 += (uint64_t)asr64((int64_t)dxs * (int64_t)dw0dx + (int64_t)dys * (int64_t)dw0dy, 4);
     }
 
-    /* edge slopes (s15.16, trunc toward 0) */
-    int32_t dxab = edge_slope(bx - ax, by - ay);
-    int32_t dxac = edge_slope(cx - ax, cy - ay);
-    int32_t dxbc = edge_slope(cx - bx, cy - by);
+    /* MAME float poly coverage (poly.h rule). Build float verts from the 12.4
+     * coords (/16), sort by Y ascending (stable) into v1,v2,v3. The iterator
+     * ORIGIN stays the ORIGINAL vertex-A register, floored: ox=ax>>4, oy=ay>>4
+     * (arithmetic). Edge slopes are double dx/dy; per-scanline span endpoints
+     * come from the long edge (v1->v3) and the appropriate minor edge, rounded
+     * with round_coordinate (ties down), winding-agnostic (swap if start>stop),
+     * EXCLUSIVE right. */
+    typedef struct { double x, y; } fvert_t;
+    fvert_t vv[3] = {
+        { (double)ax * (1.0 / 16.0), (double)ay * (1.0 / 16.0) },
+        { (double)bx * (1.0 / 16.0), (double)by * (1.0 / 16.0) },
+        { (double)cx * (1.0 / 16.0), (double)cy * (1.0 / 16.0) },
+    };
+    /* stable sort of 3 by y ascending */
+    if (vv[1].y < vv[0].y) { fvert_t t = vv[0]; vv[0] = vv[1]; vv[1] = t; }
+    if (vv[2].y < vv[1].y) { fvert_t t = vv[1]; vv[1] = vv[2]; vv[2] = t; }
+    if (vv[1].y < vv[0].y) { fvert_t t = vv[0]; vv[0] = vv[1]; vv[1] = t; }
+    double v1x = vv[0].x, v1y = vv[0].y;
+    double v2x = vv[1].x, v2y = vv[1].y;
+    double v3x = vv[2].x, v3y = vv[2].y;
 
-    int ystart0 = asr32(ay + 7, 4);
-    int yend0   = asr32(cy + 7, 4);
-    int ystart = ystart0 > ct_ ? ystart0 : ct_;
-    int yend   = yend0 < cb ? yend0 : cb;
-    int pa = asr32(ax + 7, 4);
+    double dxdy13 = (v3y != v1y) ? (v3x - v1x) / (v3y - v1y) : 0.0;
+    double dxdy12 = (v2y != v1y) ? (v2x - v1x) / (v2y - v1y) : 0.0;
+    double dxdy23 = (v3y != v2y) ? (v3x - v2x) / (v3y - v2y) : 0.0;
 
-    for (int y = ystart; y < yend; y++) {
-        int ys = (y << 4) + 8;
-        uint32_t xmaj = ((uint32_t)ax << 12) +
-                        (uint32_t)asr64((int64_t)dxac * (int64_t)(ys - ay), 4);
-        uint32_t xmin;
-        if (ys < by)
-            xmin = ((uint32_t)ax << 12) +
-                   (uint32_t)asr64((int64_t)dxab * (int64_t)(ys - ay), 4);
-        else
-            xmin = ((uint32_t)bx << 12) +
-                   (uint32_t)asr64((int64_t)dxbc * (int64_t)(ys - by), 4);
+    int ox = asr32(ax, 4);                 /* iterator origin = floor(ax/16) */
+    int oy = asr32(ay, 4);
 
-        /* MAME poly raster rule (winding-agnostic): round both edge X to
-         * nearest (ties down) -> integer pixels, swap so left<=right, draw
-         * [left,right) EXCLUSIVE. The triangleCMD sign bit is IGNORED (MAME
-         * computes winding itself), which is required to render real Glide
-         * content whose flat-top/bottom triangles arrive with sign=0 but
-         * mixed winding. round_coordinate(x_16.16) = (x + 0x7fff) >> 16. */
-        int sx = asr32((int32_t)(xmaj + 0x7fffu), 16);
-        int ex = asr32((int32_t)(xmin + 0x7fffu), 16);
-        int left  = sx < ex ? sx : ex;
-        int right = sx < ex ? ex : sx;          /* exclusive */
+    int iy1 = round_coordinate(v1y);
+    int iy3 = round_coordinate(v3y);
+    if (iy1 < ct_) iy1 = ct_;
+    if (iy3 > cb)  iy3 = cb;
+
+    for (int curscan = iy1; curscan < iy3; curscan++) {
+        double fully = (double)curscan + 0.5;
+        double startx = v1x + (fully - v1y) * dxdy13;
+        double stopx  = (fully < v2y) ? v1x + (fully - v1y) * dxdy12
+                                      : v2x + (fully - v2y) * dxdy23;
+        int istartx = round_coordinate(startx);
+        int istopx  = round_coordinate(stopx);
+        if (istartx > istopx) { int tmp = istartx; istartx = istopx; istopx = tmp; }
+        int left = istartx, right = istopx;       /* EXCLUSIVE right */
         if (left < cl)   left = cl;
         if (right > crr) right = crr;
         if (left >= right) continue;
 
-        uint32_t udy = (uint32_t)(y - ystart0);
-        uint64_t udy64 = (uint64_t)(int64_t)(y - ystart0);
+        int dy = curscan - oy;
+        uint32_t udy = (uint32_t)dy;
+        uint64_t udy64 = (uint64_t)(int64_t)dy;
         for (int x = left; x < right; x++) {
-            uint32_t udx = (uint32_t)(x - pa);
-            uint64_t udx64 = (uint64_t)(int64_t)(x - pa);
-            pixel_pipe(g, &c, x, y,
+            int dx = x - ox;
+            uint32_t udx = (uint32_t)dx;
+            uint64_t udx64 = (uint64_t)(int64_t)dx;
+            pixel_pipe(g, &c, x, curscan,
                        sr + udx * drdx + udy * drdy,
                        sg + udx * dgdx + udy * dgdy,
                        sb + udx * dbdx + udy * dbdy,

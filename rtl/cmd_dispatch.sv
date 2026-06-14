@@ -148,7 +148,10 @@ module cmd_dispatch
 
   dstate_e     state_q;
   tri_params_t tri_q;
-  logic [3:0]  dxs_q, dys_q;        // subpixel adjust factors, [0,15]
+  // subpixel adjust factors dxs/dys = 8 - (Ax&15) / 8 - (Ay&15), SIGNED range
+  // -7..8 (MAME float-coverage form, matching gold raster_triangle; NOT the old
+  // 86Box unsigned mod-16 form).
+  logic signed [4:0] dxs_q, dys_q;
   logic [3:0]  adj_idx_q;           // 0..8 over R,G,B,A,Z,W,S0,T0,W0
   logic        subpix_q;
   logic [31:0] rdata_q;
@@ -157,8 +160,9 @@ module cmd_dispatch
   logic [31:0] wdata_q;
   logic [3:0]  be_q;
 
-  // subpixel multiply-accumulate (raster-algorithm.md §2, 86Box mod-16 form):
-  // startP += (dxs*dPdX + dys*dPdY) >> 4, evaluated mod 2^32 / mod 2^64
+  // subpixel multiply-accumulate (MAME signed form, gold raster_triangle):
+  // startP += (dxs*dPdX + dys*dPdY) >> 4, evaluated mod 2^32 / mod 2^64 with
+  // dxs/dys SIGNED (-7..8) so the product sign-extends correctly.
   logic signed [63:0] adj_dx, adj_dy, adj_start64;
   logic signed [63:0] sum64;
   logic signed [31:0] sum32, new32;
@@ -176,9 +180,10 @@ module cmd_dispatch
       4'd7:    begin adj_start64 = tri_q.t0;          adj_dx = tri_q.dt0dx;      adj_dy = tri_q.dt0dy;      end
       default: begin adj_start64 = tri_q.w0;          adj_dx = tri_q.dw0dx;      adj_dy = tri_q.dw0dy;      end
     endcase
-    // products and sum wrap mod 2^64 (everything is 64-bit two's complement)
-    sum64 = 64'($signed({1'b0, dxs_q})) * adj_dx
-          + 64'($signed({1'b0, dys_q})) * adj_dy;
+    // products and sum wrap mod 2^64 (everything is 64-bit two's complement);
+    // dxs_q/dys_q are signed (-7..8) so the products sign-extend like gold.
+    sum64 = 64'(dxs_q) * adj_dx
+          + 64'(dys_q) * adj_dy;
     // 32-bit parameters: shift and accumulate mod 2^32 (low halves are exact
     // since the multipliers are non-negative and < 16)
     sum32 = $signed(sum64[31:0]);
@@ -286,9 +291,10 @@ module cmd_dispatch
                       tri_q.aux_valid <= auxoffs_valid;
                       tri_q.rowpixels <= rowpixels;
                       tri_q.yorigin   <= yorigin_eff;
-                      // subpixel adjust factors: dxs = (8 - (Ax & 15)) mod 16
-                      dxs_q     <= 4'd8 - vtx_ax[3:0];
-                      dys_q     <= 4'd8 - vtx_ay[3:0];
+                      // subpixel adjust factors: dxs = 8 - (Ax & 15), SIGNED
+                      // (-7..8); gold: int32_t dxs = 8 - (ax & 15)
+                      dxs_q     <= 5'sd8 - $signed({1'b0, vtx_ax[3:0]});
+                      dys_q     <= 5'sd8 - $signed({1'b0, vtx_ay[3:0]});
                       subpix_q  <= fbzcp[26];
                       adj_idx_q <= 4'd0;
                       // no destination buffer -> drop the triangle (gold)
