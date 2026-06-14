@@ -198,24 +198,22 @@ module raster
     edge_acc  = edge_base + 32'((mul_p >>> 4));
   end
 
-  // span endpoints (raster-algorithm.md §4: +0x7000 round bias, -0x10000
-  // pullback on the trailing/right edge only, then clip and empty-test)
-  logic signed [31:0] rawfirst_c, rawlast_c, first_c, last_c;
+  // span endpoints — MAME poly rule (winding-agnostic): round both edge X to
+  // nearest (+0x7fff, ties down) -> integer pixels, swap so lo<=hi, draw
+  // [lo,hi) EXCLUSIVE, then clip. The triangleCMD sign bit is IGNORED (MAME
+  // computes winding itself). first_c=lo, last_c=hi-1 (inclusive walk forward).
+  logic signed [31:0] sx_c, ex_c, lo_c, hi_c, first_c, last_c;
   logic               empty_c;
   always_comb begin
-    if (!sign_q) begin                 // AC is LEFT edge, walk +x
-      rawfirst_c = $signed(xmaj_q + 32'h0000_7000) >>> 16;
-      rawlast_c  = $signed(xmin_q + 32'hffff_7000) >>> 16;   // -0x10000+0x7000
-      first_c    = (rawfirst_c < cl32) ? cl32 : rawfirst_c;
-      last_c     = (rawlast_c >= cr32) ? (cr32 - 32'sd1) : rawlast_c;
-      empty_c    = (last_c < first_c);
-    end else begin                     // AC is RIGHT edge, walk -x
-      rawfirst_c = $signed(xmaj_q + 32'hffff_7000) >>> 16;
-      rawlast_c  = $signed(xmin_q + 32'h0000_7000) >>> 16;
-      first_c    = (rawfirst_c >= cr32) ? (cr32 - 32'sd1) : rawfirst_c;
-      last_c     = (rawlast_c < cl32) ? cl32 : rawlast_c;
-      empty_c    = (last_c > first_c);
-    end
+    sx_c = $signed(xmaj_q + 32'h0000_7fff) >>> 16;
+    ex_c = $signed(xmin_q + 32'h0000_7fff) >>> 16;
+    lo_c = (sx_c < ex_c) ? sx_c : ex_c;
+    hi_c = (sx_c < ex_c) ? ex_c : sx_c;
+    if (lo_c < cl32) lo_c = cl32;
+    if (hi_c > cr32) hi_c = cr32;
+    first_c = lo_c;
+    last_c  = hi_c - 32'sd1;
+    empty_c = (lo_c >= hi_c);
   end
 
   // ----------------------------------------------------------------
@@ -464,9 +462,10 @@ module raster
             if (x_q == last_q)
               state_q <= R_NEXTROW;
             else begin
-              x_q <= sign_q ? (x_q - 32'sd1) : (x_q + 32'sd1);
+              // always walk forward (left->right); winding handled by lo/hi swap
+              x_q <= x_q + 32'sd1;
               for (int i = 0; i < 9; i++)
-                pixp[i] <= sign_q ? (pixp[i] - ch_dx[i]) : (pixp[i] + ch_dx[i]);
+                pixp[i] <= pixp[i] + ch_dx[i];
             end
           end
         end
@@ -541,6 +540,7 @@ module raster
                        tri_params.stipple, tri_params.chromakey,
                        tri_params.fogcolor,
                        tri_params.aux_base, tri_params.aux_valid,
-                       tri_params.rowpixels, tri_params.yorigin};
+                       tri_params.rowpixels, tri_params.yorigin,
+                       sign_q};  // sign latched but unused (winding-agnostic raster)
 
 endmodule

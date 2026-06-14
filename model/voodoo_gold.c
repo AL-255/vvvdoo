@@ -1162,6 +1162,7 @@ static int32_t edge_slope(int dx_sub, int dy_sub)
 
 static void raster_triangle(vgold_t *g, uint32_t sign)
 {
+    (void)sign;
     pipectx_t c;
     c.fbz = R(g, REG_fbzMode);
     c.cp  = R(g, REG_fbzColorPath);
@@ -1271,26 +1272,23 @@ static void raster_triangle(vgold_t *g, uint32_t sign)
             xmin = ((uint32_t)bx << 12) +
                    (uint32_t)asr64((int64_t)dxbc * (int64_t)(ys - by), 4);
 
-        int first, last, stepx;
-        if (sign == 0) {                  /* AC is LEFT edge, walk +x */
-            first = asr32((int32_t)(xmaj + 0x7000u), 16);
-            last  = asr32((int32_t)(xmin - 0x10000u + 0x7000u), 16);
-            stepx = 1;
-            if (first < cl)   first = cl;
-            if (last >= crr)  last = crr - 1;
-            if (last < first) continue;
-        } else {                          /* AC is RIGHT edge, walk -x */
-            first = asr32((int32_t)(xmaj - 0x10000u + 0x7000u), 16);
-            last  = asr32((int32_t)(xmin + 0x7000u), 16);
-            stepx = -1;
-            if (first >= crr) first = crr - 1;
-            if (last < cl)    last = cl;
-            if (last > first) continue;
-        }
+        /* MAME poly raster rule (winding-agnostic): round both edge X to
+         * nearest (ties down) -> integer pixels, swap so left<=right, draw
+         * [left,right) EXCLUSIVE. The triangleCMD sign bit is IGNORED (MAME
+         * computes winding itself), which is required to render real Glide
+         * content whose flat-top/bottom triangles arrive with sign=0 but
+         * mixed winding. round_coordinate(x_16.16) = (x + 0x7fff) >> 16. */
+        int sx = asr32((int32_t)(xmaj + 0x7fffu), 16);
+        int ex = asr32((int32_t)(xmin + 0x7fffu), 16);
+        int left  = sx < ex ? sx : ex;
+        int right = sx < ex ? ex : sx;          /* exclusive */
+        if (left < cl)   left = cl;
+        if (right > crr) right = crr;
+        if (left >= right) continue;
 
         uint32_t udy = (uint32_t)(y - ystart0);
         uint64_t udy64 = (uint64_t)(int64_t)(y - ystart0);
-        for (int x = first; ; x += stepx) {
+        for (int x = left; x < right; x++) {
             uint32_t udx = (uint32_t)(x - pa);
             uint64_t udx64 = (uint64_t)(int64_t)(x - pa);
             pixel_pipe(g, &c, x, y,
@@ -1303,8 +1301,6 @@ static void raster_triangle(vgold_t *g, uint32_t sign)
                        s0 + udx64 * ds0dx + udy64 * ds0dy,
                        t0 + udx64 * dt0dx + udy64 * dt0dy,
                        w0 + udx64 * dw0dx + udy64 * dw0dy);
-            if (x == last)
-                break;
         }
     }
 }

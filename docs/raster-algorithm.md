@@ -1,5 +1,22 @@
 # vvvdoo triangle rasterization rule (normative)
 
+> **UPDATE (MAME-match):** the rule below described the 86Box edge-walk
+> (sign-bit-driven, `+0x7000` bias, `-0x10000` trailing pullback, inclusive
+> span). It has been **superseded** by MAME's `poly.h` rule to make the RTL
+> bit-match the MAME model and to render real Glide content correctly:
+> - **winding-agnostic**: the triangleCMD/ftriangleCMD **sign bit is IGNORED**;
+>   compute both edge X, swap so `lo<=hi`. (Real Glide sends flat-top/bottom
+>   triangles with sign=0 but mixed winding — the sign-based rule drew nothing.)
+> - **round-to-nearest, ties down**: `round(x_16.16) = (x + 0x7fff) >> 16` for
+>   BOTH edges (no trailing-edge pullback).
+> - **exclusive stop**: draw `[lo, hi)` (clip `lo>=clipLeft`, `hi<=clipRight`).
+> - Y range and iterator origin are unchanged (`(v+7)>>4`, `pA=(ax+7)>>4`).
+>   (Aligning the iterator origin to MAME's floor `ax>>4` and the float edge
+>   interpolation for full sub-pixel bit-exactness is a later refinement.)
+> Implemented in `model/voodoo_gold.c` `raster_triangle` and `rtl/raster.sv`.
+> The original 86Box description is retained below for historical reference.
+
+
 This document defines the EXACT integer rasterization algorithm implemented by
 both the golden model (`model/voodoo_gold.c`) and the RTL (`rtl/raster.sv`).
 The two must agree bit-for-bit. The rule is adopted from 86Box/PCem's Voodoo
