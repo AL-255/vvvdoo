@@ -54,6 +54,7 @@ static inline uint32_t bswap32(uint32_t v)
     return (v >> 24) | ((v >> 8) & 0x0000ff00u) | ((v << 8) & 0x00ff0000u) | (v << 24);
 }
 static inline uint32_t rot16(uint32_t v) { return (v << 16) | (v >> 16); }
+static inline uint32_t rotr32(uint32_t v, int n) { n &= 31; return (v >> n) | (v << ((32 - n) & 31)); }
 
 /* IEEE-754 float bits -> fixed point, matching MAME float_to_int32
  * (mame_voodoo.cpp:138); shifts performed in unsigned to avoid UB. */
@@ -148,6 +149,7 @@ enum {
     REG_zaColor       = 0x4c,
     REG_chromaKey     = 0x4d,
     REG_stipple       = 0x50,
+    REG_fogTable      = 0x58,    /* 0x58..0x77: 32 dwords, 2 entries each */
     REG_color0        = 0x51,
     REG_color1        = 0x52,
     REG_fbiPixelsIn   = 0x53,
@@ -183,6 +185,8 @@ static const uint8_t alias_map[0x40] = {
 
 /* fbzMode (0x44) */
 #define FBZ_clip(v)        VBIT(v,0,1)
+#define FBZ_chromakey(v)   VBIT(v,1,1)
+#define FBZ_stipple(v)     VBIT(v,2,1)
 #define FBZ_wbuffer(v)     VBIT(v,3,1)
 #define FBZ_depthen(v)     VBIT(v,4,1)
 #define FBZ_depthfn(v)     VBIT(v,5,3)
@@ -190,11 +194,22 @@ static const uint8_t alias_map[0x40] = {
 #define FBZ_rgbmask(v)     VBIT(v,9,1)
 #define FBZ_auxmask(v)     VBIT(v,10,1)
 #define FBZ_dither2(v)     VBIT(v,11,1)
+#define FBZ_stipplepat(v)  VBIT(v,12,1)
+#define FBZ_alphamask(v)   VBIT(v,13,1)
 #define FBZ_drawbuf(v)     VBIT(v,14,2)
 #define FBZ_depthbias(v)   VBIT(v,16,1)
 #define FBZ_yorigin(v)     VBIT(v,17,1)
 #define FBZ_alphaplanes(v) VBIT(v,18,1)
 #define FBZ_depthsrc(v)    VBIT(v,20,1)
+
+/* fogMode (0x42) */
+#define FOG_enable(v)      VBIT(v,0,1)
+#define FOG_add(v)         VBIT(v,1,1)
+#define FOG_mult(v)        VBIT(v,2,1)
+#define FOG_zalpha(v)      VBIT(v,3,2)
+#define FOG_constant(v)    VBIT(v,5,1)
+#define FOG_dither(v)      VBIT(v,6,1)   /* V2 */
+#define FOG_zones(v)       VBIT(v,7,1)   /* V2 */
 
 /* alphaMode (0x43) */
 #define AM_test(v)         VBIT(v,0,1)
@@ -258,6 +273,7 @@ static const uint8_t alias_map[0x40] = {
 #define LFB_wswap(v)       VBIT(v,11,1)
 #define LFB_byteswz(v)     VBIT(v,12,1)
 #define LFB_yorigin(v)     VBIT(v,13,1)
+#define LFB_wsel(v)        VBIT(v,14,1)
 #define LFB_wswap_r(v)     VBIT(v,15,1)
 #define LFB_byteswz_r(v)   VBIT(v,16,1)
 
@@ -306,6 +322,10 @@ struct vgold {
     int       tformat, bpt;
     int       lodmin, lodmax, lodbias, lodmask;
     uint16_t  pal565[256];
+
+    /* M4: fog tables (MAME m_fogblend/m_fogdelta), 64 u8 entries each */
+    uint8_t   fogblend[64];
+    uint8_t   fogdelta[64];
 };
 
 static inline uint32_t R(const vgold_t *g, int idx) { return g->regs[idx]; }
@@ -786,8 +806,11 @@ static argb_t combine_generic(combine_ctl c, argb_t other, argb_t local, int tex
 /*  (mame_voodoo_render.cpp:1511-1729; chroma key / alpha mask = M4)   */
 /* ================================================================== */
 
-static argb_t combine_color_full(const vgold_t *g, uint32_t cp, argb_t iter,
-                                 argb_t texel, int32_t iterz, int64_t iterw)
+/* Returns true to keep the pixel, false to discard (chroma key / alpha mask
+ * fail). On keep, *out receives the combined color. fbz is needed for the
+ * chroma-key / alpha-mask enable bits (the tests live INSIDE combine). */
+static bool combine_color_full(const vgold_t *g, uint32_t cp, uint32_t fbz, argb_t iter,
+                               argb_t texel, int32_t iterz, int64_t iterw, argb_t *out)
 {
     uint32_t c0v = R(g, REG_color0), c1v = R(g, REG_color1);
     argb_t color0 = { (int)VBIT(c0v, 24, 8), (int)VBIT(c0v, 16, 8),
@@ -803,14 +826,24 @@ static argb_t combine_color_full(const vgold_t *g, uint32_t cp, argb_t iter,
     case 2:  cother.r = color1.r; cother.g = color1.g; cother.b = color1.b; break;
     default: cother.r = cother.g = cother.b = 0; break;
     }
-    /* chroma key test: M4 (always pass) */
+    /* chroma key test (basic V1 match), on c_other RGB, after rgbselect */
+    if (FBZ_chromakey(fbz)) {
+        uint32_t ck = R(g, REG_chromaKey) & 0xffffffu;
+        uint32_t cv = (((uint32_t)(cother.r & 0xff)) << 16) |
+                      (((uint32_t)(cother.g & 0xff)) << 8) |
+                       ((uint32_t)(cother.b & 0xff));
+        if (((cv ^ ck) & 0xffffffu) == 0)
+            return false;
+    }
     switch (CP_aselect(cp)) {
     case 0:  cother.a = iter.a;   break;
     case 1:  cother.a = texel.a;  break;
     case 2:  cother.a = color1.a; break;
     default: cother.a = 0; break;
     }
-    /* alpha mask test: M4 (always pass) */
+    /* alpha mask test, on a_other, after aselect */
+    if (FBZ_alphamask(fbz) && (cother.a & 1) == 0)
+        return false;
 
     /* c_local */
     argb_t clocal;
@@ -866,15 +899,93 @@ static argb_t combine_color_full(const vgold_t *g, uint32_t cp, argb_t iter,
 
     /* (factor+1) multiply, >>8, add, clamp */
     fr++; fg++; fb++; fa++;
-    argb_t out;
-    out.r = iclamp(asr32(br * fr, 8) + ar, 0, 255);
-    out.g = iclamp(asr32(bg * fg, 8) + ag, 0, 255);
-    out.b = iclamp(asr32(bb * fb, 8) + ab, 0, 255);
-    out.a = iclamp(asr32(ba * fa, 8) + aa, 0, 255);
+    argb_t cv;
+    cv.r = iclamp(asr32(br * fr, 8) + ar, 0, 255);
+    cv.g = iclamp(asr32(bg * fg, 8) + ag, 0, 255);
+    cv.b = iclamp(asr32(bb * fb, 8) + ab, 0, 255);
+    cv.a = iclamp(asr32(ba * fa, 8) + aa, 0, 255);
 
-    if (CP_cca_invert(cp)) out.a ^= 0xff;
-    if (CP_invert(cp))     { out.r ^= 0xff; out.g ^= 0xff; out.b ^= 0xff; }
-    return out;
+    if (CP_cca_invert(cp)) cv.a ^= 0xff;
+    if (CP_invert(cp))     { cv.r ^= 0xff; cv.g ^= 0xff; cv.b ^= 0xff; }
+    *out = cv;
+    return true;
+}
+
+/* ================================================================== */
+/*  fog — exact MAME apply_fogging (render.cpp:1896-1981)              */
+/* ================================================================== */
+
+/* Applies fog to `color` in place. fogcolor is the fogColor reg argb.
+ * depthbias = zaColor; wfloat is the per-pixel wfloat; iterz/iterw the
+ * iterators; itera = iterated alpha (for fog_zalpha==1). Alpha preserved. */
+static void apply_fogging(const vgold_t *g, argb_t *color, uint32_t fogcolor,
+                          uint32_t depthbias, uint32_t fbz, uint32_t fogmode,
+                          uint32_t cp, int32_t wfloat, int32_t iterz,
+                          int64_t iterw, int itera)
+{
+    argb_t fc = { (int)VBIT(fogcolor, 24, 8), (int)VBIT(fogcolor, 16, 8),
+                  (int)VBIT(fogcolor, 8, 8),  (int)VBIT(fogcolor, 0, 8) };
+
+    if (FOG_constant(fogmode)) {
+        /* constant fog bypasses everything else */
+        if (FOG_mult(fogmode) == 0) {
+            fc.r = iclamp(fc.r + color->r, 0, 255);
+            fc.g = iclamp(fc.g + color->g, 0, 255);
+            fc.b = iclamp(fc.b + color->b, 0, 255);
+        }
+    } else {
+        int32_t fogblend = 0;
+
+        /* if fog_add is set, start with zero instead of the fog color */
+        if (FOG_add(fogmode)) { fc.r = fc.g = fc.b = 0; }
+
+        /* if fog_mult is zero, subtract the incoming color */
+        if (!FOG_mult(fogmode)) {
+            fc.r -= color->r; fc.g -= color->g; fc.b -= color->b;
+        }
+
+        switch (FOG_zalpha(fogmode)) {
+        case 0: {       /* fog table */
+            int32_t fog_depth = wfloat;
+            if (FBZ_depthbias(fbz))
+                fog_depth = iclamp(fog_depth + (int32_t)(int16_t)(uint16_t)(depthbias & 0xffff),
+                                   0, 0xffff);
+            int32_t delta = g->fogdelta[(fog_depth >> 10) & 0x3f];
+            int32_t deltaval = (delta & 0xff) * ((fog_depth >> 2) & 0xff);  /* fogdelta_mask=0xff V1 */
+            if (FOG_zones(fogmode) && (delta & 2))                          /* V2 */
+                deltaval = -deltaval;
+            deltaval >>= 6;
+            /* fog_dither (V2) skipped */
+            deltaval >>= 4;
+            fogblend = g->fogblend[(fog_depth >> 10) & 0x3f] + deltaval;
+            break;
+        }
+        case 1:         /* iterated A */
+            fogblend = itera;
+            break;
+        case 2:         /* iterated Z */
+            fogblend = clamped_z(iterz, cp) >> 8;
+            break;
+        case 3:         /* iterated W (V2) */
+            fogblend = clamped_w(iterw, cp);
+            break;
+        }
+
+        /* perform the blend: scale_imm_and_clamp(s16(fogblend)) */
+        fogblend++;
+        int16_t sf = (int16_t)fogblend;
+        fc.r = iclamp(asr32(fc.r * sf, 8), 0, 255);
+        fc.g = iclamp(asr32(fc.g * sf, 8), 0, 255);
+        fc.b = iclamp(asr32(fc.b * sf, 8), 0, 255);
+        if (FOG_mult(fogmode) == 0) {
+            fc.r = iclamp(fc.r + color->r, 0, 255);
+            fc.g = iclamp(fc.g + color->g, 0, 255);
+            fc.b = iclamp(fc.b + color->b, 0, 255);
+        }
+    }
+
+    /* preserve original alpha */
+    color->r = fc.r; color->g = fc.g; color->b = fc.b;
 }
 
 /* ================================================================== */
@@ -938,24 +1049,39 @@ static argb_t alpha_blend_full(uint32_t am, argb_t src, argb_t prefog, uint16_t 
 /* ================================================================== */
 
 typedef struct {
-    uint32_t fbz, cp, am, tm;
+    uint32_t fbz, cp, am, tm, fm;   /* fm = fogMode */
     uint32_t zacolor;
+    uint32_t fogcolor;
     uint32_t destoffs;          /* byte offset of color buffer */
     bool     have_aux;
     int      yor;               /* effective y-origin */
     bool     texturing;
     int      lodbase;
     combine_ctl ctex;
+    uint32_t stipple;           /* running stipple copy (mutated in rotate mode) */
 } pipectx_t;
 
-static void pixel_pipe(vgold_t *g, const pipectx_t *c, int x, int y,
+static void pixel_pipe(vgold_t *g, pipectx_t *c, int x, int y,
                        uint32_t ur, uint32_t ug, uint32_t ub, uint32_t ua,
                        uint32_t uz, uint64_t uw,
                        uint64_t us0, uint64_t ut0, uint64_t uw0)
 {
     int sy = FBZ_yorigin(c->fbz) ? (c->yor - y) : y;
 
-    /* 1) wfloat */
+    /* 1) stipple test (spec §4 step 1, before wfloat) */
+    if (FBZ_stipple(c->fbz)) {
+        if (FBZ_stipplepat(c->fbz)) {
+            int idx = ((sy & 3) << 3) | (~x & 7);
+            if (((c->stipple >> idx) & 1) == 0)
+                return;
+        } else {
+            c->stipple = rotr32(c->stipple, 1);
+            if ((int32_t)c->stipple >= 0)
+                return;
+        }
+    }
+
+    /* 1b) wfloat */
     int32_t wfloat = wfloat_of((int64_t)uw);
 
     /* 2) depth value + test */
@@ -988,15 +1114,24 @@ static void pixel_pipe(vgold_t *g, const pipectx_t *c, int x, int y,
         texel = combine_generic(c->ctex, zero, raw, raw.a, 0);
     }
 
-    argb_t color = combine_color_full(g, c->cp, iter, texel, (int32_t)uz, (int64_t)uw);
-    /* chroma key / alpha mask / stipple / fog: M4 (always pass) */
+    argb_t color;
+    /* chroma key + alpha mask happen INSIDE combine; failure discards */
+    if (!combine_color_full(g, c->cp, c->fbz, iter, texel, (int32_t)uz, (int64_t)uw, &color))
+        return;
 
     /* 4) alpha test */
     if (AM_test(c->am) && !compare_func((int)AM_func(c->am), color.a, (int)AM_ref(c->am)))
         return;
 
-    /* 5) alpha blend (fog off => prefog == color) */
+    /* 5) fog (after alpha test, before alpha blend). prefog saved AFTER fog
+     * (MAME saves prefog := post-combine color, then fogs into `color`; the
+     * blend's A_COLORBEFOREFOG dst path uses prefog = pre-fog color). */
     argb_t prefog = color;
+    if (FOG_enable(c->fm))
+        apply_fogging(g, &color, c->fogcolor, c->zacolor, c->fbz, c->fm, c->cp,
+                      wfloat, (int32_t)uz, (int64_t)uw, iter.a);
+
+    /* 6) alpha blend */
     if (AM_blend(c->am)) {
         uint16_t dpix = 0;
         if (fb_word_ok(g, c->destoffs, sy, x))
@@ -1032,9 +1167,13 @@ static void raster_triangle(vgold_t *g, uint32_t sign)
     c.cp  = R(g, REG_fbzColorPath);
     c.am  = R(g, REG_alphaMode);
     c.tm  = R(g, REG_textureMode);
+    c.fm  = R(g, REG_fogMode);
     c.zacolor = R(g, REG_zaColor);
+    c.fogcolor = R(g, REG_fogColor);
     c.yor = yorigin_eff(g);
     c.have_aux = (g->auxoffs != ~0u);
+    /* reseed the running stipple from the register at each primitive launch */
+    c.stipple = R(g, REG_stipple);
 
     c.destoffs = draw_buffer_offs(g, (int)FBZ_drawbuf(c.fbz));
     if (c.destoffs == ~0u)
@@ -1393,6 +1532,91 @@ static uint32_t expand_lfb_data(const vgold_t *g, uint32_t lfb, uint32_t data,
 #undef ARGBX
 }
 
+/* LFB pixel-pipeline write of one expanded pixel (MAME pixel_pipeline,
+ * render.cpp:2152). depthval is taken directly from src_depth (no bias);
+ * the source color is the expanded LFB RGBA; iterz/iterw derive from sz and
+ * zaColor exactly as MAME. y is the unflipped row. */
+static void lfb_pixel_pipeline(vgold_t *g, int x, int y, argb_t src, uint16_t sz)
+{
+    uint32_t fbz = R(g, REG_fbzMode);
+    uint32_t cp  = R(g, REG_fbzColorPath);
+    uint32_t am  = R(g, REG_alphaMode);
+    uint32_t fm  = R(g, REG_fogMode);
+    uint32_t lfb = R(g, REG_lfbMode);
+    uint32_t za  = R(g, REG_zaColor);
+
+    int scry = FBZ_yorigin(fbz) ? (yorigin_eff(g) - y) : y;
+
+    uint32_t destoffs = draw_buffer_offs(g, (int)LFB_wbufsel(lfb));
+    if (destoffs == ~0u)
+        return;
+    bool have_aux = (g->auxoffs != ~0u);
+
+    /* stipple (reseeded from the register each LFB pixel, per MAME) */
+    if (FBZ_stipple(fbz)) {
+        uint32_t stip = R(g, REG_stipple);
+        if (FBZ_stipplepat(fbz)) {
+            int idx = ((scry & 3) << 3) | (~x & 7);
+            if (((stip >> idx) & 1) == 0)
+                return;
+        } else {
+            stip = rotr32(stip, 1);
+            if ((int32_t)stip >= 0)
+                return;
+        }
+    }
+
+    /* depth: value is directly sz (no biasing for LFB pipeline writes) */
+    int32_t depthval = (int32_t)(uint32_t)sz;
+    int32_t depthsrc = FBZ_depthsrc(fbz) ? (int32_t)(za & 0xffff) : depthval;
+    if (FBZ_depthen(fbz) && have_aux) {
+        if (fb_word_ok(g, g->auxoffs, scry, x)) {
+            int stored = g->fb[fb_word_index(g, g->auxoffs, scry, x)];
+            if (!compare_func((int)FBZ_depthfn(fbz), depthsrc, stored))
+                return;
+        }
+    }
+
+    /* combine: c_other/c_local source from the LFB color; chroma key + alpha
+     * mask live inside combine. texel = white (no texturing on LFB writes). */
+    argb_t texel = { 255, 255, 255, 255 };
+    int32_t iterz = (int32_t)((uint32_t)sz << 12);
+    /* iterw per MAME: write_w_select ? u32(za<<16) : u32(sz<<16). lfbMode
+     * write_w_select is bit 1. */
+    int64_t iterw = (int64_t)(uint32_t)(LFB_wsel(lfb) ? (za << 16) : ((uint32_t)sz << 16));
+
+    argb_t color;
+    if (!combine_color_full(g, cp, fbz, src, texel, iterz, iterw, &color))
+        return;
+
+    /* alpha test */
+    if (AM_test(am) && !compare_func((int)AM_func(am), color.a, (int)AM_ref(am)))
+        return;
+
+    /* fog (wfloat = depthval; iterargb alpha = 0 per MAME rgbaint_t(0)) */
+    argb_t prefog = color;
+    if (FOG_enable(fm))
+        apply_fogging(g, &color, R(g, REG_fogColor), za, fbz, fm, cp,
+                      depthval, iterz, iterw, 0);
+
+    /* alpha blend */
+    if (AM_blend(am)) {
+        uint16_t dpix = 0;
+        if (fb_word_ok(g, destoffs, scry, x))
+            dpix = g->fb[fb_word_index(g, destoffs, scry, x)];
+        color = alpha_blend_full(am, color, prefog, dpix);
+    }
+
+    /* write */
+    if (FBZ_rgbmask(fbz) && fb_word_ok(g, destoffs, scry, x))
+        g->fb[fb_word_index(g, destoffs, scry, x)] =
+            dither565(fbz, x, scry, color.r, color.g, color.b);
+    if (FBZ_auxmask(fbz) && have_aux && fb_word_ok(g, g->auxoffs, scry, x))
+        g->fb[fb_word_index(g, g->auxoffs, scry, x)] =
+            FBZ_alphaplanes(fbz) ? (uint16_t)color.a : (uint16_t)depthval;
+    g->regs[REG_fbiPixelsOut]++;
+}
+
 static void lfb_write(vgold_t *g, uint32_t dwoff, uint32_t data, uint32_t mem_mask)
 {
     uint32_t lfb = R(g, REG_lfbMode);
@@ -1425,7 +1649,18 @@ static void lfb_write(vgold_t *g, uint32_t dwoff, uint32_t data, uint32_t mem_ma
     if (LFB_yorigin(lfb))
         scry = yorigin_eff(g) - y;
 
-    /* raw path (lfbMode bit8 treated as raw until M4, CONTRACTS §9.10) */
+    /* pixel-pipeline path (lfbMode bit8): run the expanded src color/depth
+     * through the full per-pixel pipeline (MAME internal_lfb_w tricky case). */
+    if (LFB_pixpipe(lfb)) {
+        int xx = x;
+        for (uint32_t m = mask; m != 0; m >>= 4, xx++) {
+            if (m & LFB_PIX0)
+                lfb_pixel_pipeline(g, xx, y, col[(xx - x) & 1], dep[(xx - x) & 1]);
+        }
+        return;
+    }
+
+    /* raw path */
     for (int pix = 0; mask != 0; pix++) {
         if (mask & LFB_PIX0) {
             int px = x + pix;
@@ -1555,6 +1790,17 @@ static void reg_write(vgold_t *g, uint32_t regnum, uint32_t data)
     }
     if (is_w((int)regnum)) {
         set_stw(g, (int)regnum, shl64((int64_t)(int32_t)data, 2));
+        return;
+    }
+
+    /* fogTable write decode (regnum 0x58..0x77 -> write_fog), MAME-exact */
+    if (regnum >= REG_fogTable && regnum <= 0x77) {
+        uint32_t base = 2u * (regnum - REG_fogTable);
+        g->fogdelta[base + 0] = (uint8_t)VBIT(data, 0, 8);
+        g->fogblend[base + 0] = (uint8_t)VBIT(data, 8, 8);
+        g->fogdelta[base + 1] = (uint8_t)VBIT(data, 16, 8);
+        g->fogblend[base + 1] = (uint8_t)VBIT(data, 24, 8);
+        g->regs[regnum] = data;
         return;
     }
 

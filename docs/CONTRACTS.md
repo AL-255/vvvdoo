@@ -488,6 +488,59 @@ Interfaces (verbatim):
 M3 done = `make lint` clean; `make test` (unit + test-m1 + test-m2 + test-m3)
 all PIXEL-EXACT. test-m1/m2 must NOT regress.
 
+## 11c. M4 — full pixel pipeline (stipple, chroma key, alpha mask, fog, LFB pipe)
+
+Implement in BOTH gold and RTL; add trace coverage; re-freeze CRCs. All
+semantics are MAME-exact (mame_voodoo_render.cpp / mame_voodoo.cpp). Pipeline
+order (spec §4): **stipple → wfloat → depth → texture → color-combine (chroma
+key + alpha mask happen INSIDE combine) → alpha test → fog → alpha blend →
+write**.
+
+1. **Stipple** (fbzMode bit2 enable_stipple), per pixel BEFORE wfloat/depth,
+   using the `stipple` register (0x50):
+   - pattern mode (fbzMode bit12 stipple_pattern==1): index =
+     `((scry&3)<<3)|(~x&7)`; if `bit(stipple,index)==0` → discard.
+   - rotate mode (bit12==0): `stipple = rotr32(stipple,1)`; if
+     `(int32)stipple >= 0` (top bit clear) → discard. NOTE: rotate mode MUTATES
+     the stipple register state across pixels — gold and RTL must both keep a
+     running copy seeded from the register at triangle/fill launch (per MAME the
+     poly carries the stipple; reseed per primitive).
+2. **Chroma key** (fbzMode bit1 enable_chromakey), INSIDE color-combine right
+   after c_other RGB is selected (cc_rgbselect), tested on c_other RGB:
+   basic V1 test `((c_other_rgb ^ chromaKey) & 0xffffff) == 0` → discard.
+   (chroma_range is V2; not required for SST-1 — implement the basic match.)
+3. **Alpha mask** (fbzMode bit13 enable_alpha_mask), INSIDE color-combine right
+   after a_other is selected (cc_aselect): if `(a_other & 1) == 0` → discard.
+4. **Fog** (fogMode 0x42), AFTER alpha test, BEFORE alpha blend. fogMode bits:
+   enable_fog[0], fog_add[1], fog_mult[2], fog_zalpha[4:3], fog_constant[5],
+   fog_dither[6](V2), fog_zones[7](V2). Fog color = fogColor reg (0x4b) argb.
+   apply_fogging (mame render.cpp:1896): see that function — constant-fog
+   bypass; else start-from-fogcolor-or-zero (fog_add), subtract incoming color
+   (fog_mult==0), pick fogblend from fog_zalpha (0=table, 1=iter alpha,
+   2=clamped_z(iterz)>>8, 3=clamped_w — V2), fogblend++, scale, add color back
+   if fog_mult==0, clamp, preserve original alpha.
+   Fog table: regs fogTable 0x58..0x77 (32 dwords). A write to fogTable index k
+   sets `base = 2*(k-0x58)`; `fogdelta[base]=data[7:0]; fogblend[base]=data
+   [15:8]; fogdelta[base+1]=data[23:16]; fogblend[base+1]=data[31:24]` → two
+   64-entry u8 tables m_fogblend/m_fogdelta. fogdelta_mask=0xff (V1). Table
+   blend (fog_zalpha==0): `fog_depth = wfloat (+ s16(zaColor) clamp if depth
+   bias)`; `delta=fogdelta[fog_depth>>10]`; `deltaval=(delta&mask)*((fog_depth
+   >>2)&0xff)`; (fog_zones&&(delta&2)) negate (V2); `deltaval>>=6`; (+dither
+   V2); `deltaval>>=4`; `fogblend = m_fogblend[fog_depth>>10] + deltaval`.
+5. **LFB pixel-pipeline writes** (lfbMode bit8 enable_pixel_pipeline==1): route
+   the LFB write's expanded src color/depth through the SAME per-pixel pipeline
+   (depth/chroma/alpha/fog/blend/dither/write) instead of the raw store. MAME
+   internal_lfb_w "tricky case" + pixel_pipeline (render.cpp:2152). The src
+   color comes from expand_lfb_data; src depth/iterz from zaColor; iters/w from
+   zaColor-derived constants (see MAME pixel_pipeline args). tracegen MAY now
+   set lfbMode bit8.
+
+M4 done = gold + RTL pixel-exact on all traces (re-frozen CRCs), `make lint`
+clean, `make test` green incl. new M4-feature coverage in the traces. The
+non-M4 traces (m1/m2/m3) must keep rendering identically EXCEPT where new
+default-off features leave them unchanged (they will: all new features are
+gated off by default, so m1/m2/m3 CRCs MUST stay 5e7440cc/71100aec/d864b68c).
+
 ## 12. Definition of done (this turn)
 
 - `make lint` clean; `make gold traces unit` green.

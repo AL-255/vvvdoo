@@ -51,6 +51,7 @@ enum {
     REG_fdSdY = 0x3d, REG_fdTdY = 0x3e, REG_fdWdY = 0x3f,
     REG_ftriangleCMD = 0x40,
     REG_fbzColorPath = 0x41,
+    REG_fogMode = 0x42,
     REG_alphaMode = 0x43,
     REG_fbzMode = 0x44,
     REG_lfbMode = 0x45,
@@ -59,9 +60,13 @@ enum {
     REG_nopCMD = 0x48,
     REG_fastfillCMD = 0x49,
     REG_swapbufferCMD = 0x4a,
+    REG_fogColor = 0x4b,
     REG_zaColor = 0x4c,
+    REG_chromaKey = 0x4d,
+    REG_stipple = 0x50,
     REG_color0 = 0x51,
     REG_color1 = 0x52,
+    REG_fogTable = 0x58,
     REG_videoDimensions = 0x83,
     REG_fbiInit0 = 0x84,
     REG_fbiInit1 = 0x85,
@@ -1119,6 +1124,200 @@ static void gen_m3(const char *dir)
     end_trace(dir, "m3_selftest_full");
 }
 
+/* ---------------- m4: full pixel pipeline ------------------------------ */
+/* Stipple, chroma key, alpha mask, fog, and LFB-pixel-pipeline coverage.
+ * All in its own trace so the frozen m1/m2/m3 CRCs are untouched. */
+
+/* fbzMode bits used here: clip on, rgb+aux mask, draw=back, dither 4x4 */
+#define M4_FBZ ((1u<<0)|(1u<<8)|(1u<<9)|(1u<<10)|(1u<<14))
+
+static void gen_m4(const char *dir)
+{
+    begin_trace();
+    common_init();
+
+    regw(REG_fbzMode, M4_FBZ);
+    regw(REG_alphaMode, 0);
+    regw(REG_fogMode, 0);
+    regw(REG_fbzColorPath, 1u << 28);          /* iterated color, saturate */
+    regw(REG_textureMode, 0);
+
+    /* clear back buffer to dark grey, depth = far */
+    regw(REG_color1, 0x00303030);
+    regw(REG_zaColor, 0x0000ffff);
+    regw(REG_fastfillCMD, 0);
+
+    /* ---- stipple, pattern mode (fbzMode bit2 + bit12) ---- */
+    mark(0x4100);
+    regw(REG_stipple, 0xaa55aa55u);            /* checker-ish pattern */
+    regw(REG_fbzMode, M4_FBZ | (1u << 2) | (1u << 12));
+    {
+        tvtx_t a = fv(40.0,  30.0, 255, 80, 80, 255, 0x4000);
+        tvtx_t b = fv(280.0, 30.0, 255, 80, 80, 255, 0x4000);
+        tvtx_t c = fv(40.0,  150.0, 255, 80, 80, 255, 0x4000);
+        tri_submit(&a, &b, &c, 0);
+        tvtx_t d = fv(280.0, 30.0, 255, 80, 80, 255, 0x4000);
+        tvtx_t e = fv(280.0, 150.0, 255, 80, 80, 255, 0x4000);
+        tvtx_t f = fv(40.0,  150.0, 255, 80, 80, 255, 0x4000);
+        tri_submit(&d, &e, &f, 0);
+    }
+
+    /* ---- stipple, rotate mode (fbzMode bit2, bit12=0) ---- */
+    mark(0x4101);
+    regw(REG_stipple, 0xf0f0f0f0u);            /* run of set/clear top bits */
+    regw(REG_fbzMode, M4_FBZ | (1u << 2));
+    {
+        tvtx_t a = fv(320.0, 30.0, 80, 255, 80, 255, 0x4000);
+        tvtx_t b = fv(560.0, 30.0, 80, 255, 80, 255, 0x4000);
+        tvtx_t c = fv(320.0, 150.0, 80, 255, 80, 255, 0x4000);
+        tri_submit(&a, &b, &c, 0);
+        tvtx_t d = fv(560.0, 30.0, 80, 255, 80, 255, 0x4000);
+        tvtx_t e = fv(560.0, 150.0, 80, 255, 80, 255, 0x4000);
+        tvtx_t f = fv(320.0, 150.0, 80, 255, 80, 255, 0x4000);
+        tri_submit(&d, &e, &f, 0);
+    }
+    regw(REG_fbzMode, M4_FBZ);
+
+    /* ---- chroma key (fbzMode bit1): green pixels are punched out ---- */
+    mark(0x4200);
+    /* First lay down a flat YELLOW block (chroma off). Then draw a flat PURE
+     * GREEN block over its left half with chroma-key=green: every green pixel
+     * matches and is discarded, so the yellow shows through (a clean hole).
+     * The right half is drawn green again but keyed to a non-matching colour
+     * so it survives -> green block beside the keyed-out (yellow) region. */
+    regw(REG_fbzColorPath, 1u << 28);
+    regw(REG_fbzMode, M4_FBZ);                 /* chroma off: paint yellow base */
+    {
+        tvtx_t a = fv(40.0,  180.0, 255, 255, 0, 255, 0x4000);
+        tvtx_t b = fv(280.0, 180.0, 255, 255, 0, 255, 0x4000);
+        tvtx_t c = fv(40.0,  300.0, 255, 255, 0, 255, 0x4000);
+        tri_submit(&a, &b, &c, 0);
+        tvtx_t d = fv(280.0, 180.0, 255, 255, 0, 255, 0x4000);
+        tvtx_t e = fv(280.0, 300.0, 255, 255, 0, 255, 0x4000);
+        tvtx_t f = fv(40.0,  300.0, 255, 255, 0, 255, 0x4000);
+        tri_submit(&d, &e, &f, 0);
+    }
+    /* flat pure-green block over the left half, keyed to green -> all discarded */
+    regw(REG_chromaKey, 0x0000ff00u);          /* match pure green (R0 G255 B0) */
+    regw(REG_fbzMode, M4_FBZ | (1u << 1));
+    {
+        tvtx_t a = fv(40.0,  190.0, 0, 255, 0, 255, 0x4000);
+        tvtx_t b = fv(160.0, 190.0, 0, 255, 0, 255, 0x4000);
+        tvtx_t c = fv(40.0,  290.0, 0, 255, 0, 255, 0x4000);
+        tri_submit(&a, &b, &c, 0);
+        tvtx_t d = fv(160.0, 190.0, 0, 255, 0, 255, 0x4000);
+        tvtx_t e = fv(160.0, 290.0, 0, 255, 0, 255, 0x4000);
+        tvtx_t f = fv(40.0,  290.0, 0, 255, 0, 255, 0x4000);
+        tri_submit(&d, &e, &f, 0);            /* -> vanishes, yellow shows */
+    }
+    /* right half: green again but key to a colour it does NOT match -> survives */
+    regw(REG_chromaKey, 0x00123456u);
+    {
+        tvtx_t a = fv(160.0, 190.0, 0, 255, 0, 255, 0x4000);
+        tvtx_t b = fv(280.0, 190.0, 0, 255, 0, 255, 0x4000);
+        tvtx_t c = fv(160.0, 290.0, 0, 255, 0, 255, 0x4000);
+        tri_submit(&a, &b, &c, 0);
+        tvtx_t d = fv(280.0, 190.0, 0, 255, 0, 255, 0x4000);
+        tvtx_t e = fv(280.0, 290.0, 0, 255, 0, 255, 0x4000);
+        tvtx_t f = fv(160.0, 290.0, 0, 255, 0, 255, 0x4000);
+        tri_submit(&d, &e, &f, 0);            /* -> green survives */
+    }
+    regw(REG_fbzMode, M4_FBZ);
+
+    /* ---- alpha mask (fbzMode bit13): odd-alpha kept, even-alpha dropped ---- */
+    mark(0x4300);
+    /* a_other = iterated alpha; alpha ramps so LSB toggles -> stripes */
+    regw(REG_fbzMode, M4_FBZ | (1u << 13));
+    {
+        tvtx_t a = fv(320.0, 180.0, 120, 120, 255, 0,   0x4000);
+        tvtx_t b = fv(560.0, 180.0, 120, 120, 255, 255, 0x4000);
+        tvtx_t c = fv(320.0, 300.0, 120, 120, 255, 0,   0x4000);
+        tri_submit(&a, &b, &c, 0);
+        tvtx_t d = fv(560.0, 180.0, 120, 120, 255, 255, 0x4000);
+        tvtx_t e = fv(560.0, 300.0, 120, 120, 255, 255, 0x4000);
+        tvtx_t f = fv(320.0, 300.0, 120, 120, 255, 0,   0x4000);
+        tri_submit(&d, &e, &f, 0);
+    }
+    regw(REG_fbzMode, M4_FBZ);
+
+    /* ---- fog: program a fog table ramp, enable table-sourced fog ---- */
+    mark(0x4400);
+    regw(REG_fogColor, 0x00ffffffu);           /* fog toward white */
+    /* fog table: 64 (blend,delta) entries, 2 per dword over 0x58..0x77.
+     * Program a linear blend ramp 0..252 and a small constant delta. */
+    for (uint32_t k = 0; k < 32; k++) {
+        uint32_t b0 = (2 * k + 0) * 4;         /* blend for entry 2k   */
+        uint32_t b1 = (2 * k + 1) * 4;         /* blend for entry 2k+1 */
+        if (b0 > 255) b0 = 255;
+        if (b1 > 255) b1 = 255;
+        uint32_t d0 = 0x10, d1 = 0x10;         /* delta */
+        uint32_t dword = (d0 & 0xff) | ((b0 & 0xff) << 8) |
+                         ((d1 & 0xff) << 16) | ((b1 & 0xff) << 24);
+        regw(REG_fogTable + k, dword);
+    }
+    /* fog enable, table source (fog_zalpha=0), fog_mult=0 (subtract incoming) */
+    regw(REG_fogMode, 1u);
+    /* W-buffer so wfloat (=fog depth) varies with the W gradient across the tri */
+    regw(REG_fbzMode, M4_FBZ | (1u << 3));
+    {
+        tvtx_t a = fv(40.0,  320.0, 60, 200, 255, 255, 0);
+        tvtx_t b = fv(280.0, 320.0, 60, 200, 255, 255, 0);
+        tvtx_t c = fv(40.0,  450.0, 60, 200, 255, 255, 0);
+        a.w = 1.75; b.w = 0.10; c.w = 0.90;
+        tri_submit(&a, &b, &c, T_W);
+        tvtx_t d = fv(280.0, 320.0, 60, 200, 255, 255, 0);
+        tvtx_t e = fv(280.0, 450.0, 60, 200, 255, 255, 0);
+        tvtx_t f = fv(40.0,  450.0, 60, 200, 255, 255, 0);
+        d.w = 0.10; e.w = 0.55; f.w = 0.90;
+        tri_submit(&d, &e, &f, T_W);
+    }
+    regw(REG_fbzMode, M4_FBZ);
+
+    /* ---- fog: constant-fog case (fogMode bit5), fog_mult=0 -> add fogcolor */
+    mark(0x4401);
+    regw(REG_fogColor, 0x00400000u);           /* add dark red */
+    regw(REG_fogMode, 1u | (1u << 5));         /* enable + fog_constant */
+    {
+        tvtx_t a = fv(320.0, 320.0, 40, 40, 200, 255, 0x4000);
+        tvtx_t b = fv(560.0, 320.0, 40, 40, 200, 255, 0x4000);
+        tvtx_t c = fv(320.0, 450.0, 40, 40, 200, 255, 0x4000);
+        tri_submit(&a, &b, &c, 0);
+        tvtx_t d = fv(560.0, 320.0, 40, 40, 200, 255, 0x4000);
+        tvtx_t e = fv(560.0, 450.0, 40, 40, 200, 255, 0x4000);
+        tvtx_t f = fv(320.0, 450.0, 40, 40, 200, 255, 0x4000);
+        tri_submit(&d, &e, &f, 0);
+    }
+    regw(REG_fogMode, 0);
+
+    /* ---- LFB pixel-pipeline writes (lfbMode bit8) ---- */
+    mark(0x4500);
+    /* write a block of ARGB8888 pixels routed through the pipeline with an
+     * alpha test that drops low-alpha pixels, proving the pipe runs */
+    regw(REG_fbzColorPath, 0);                 /* c_other = iterated... but for
+                                                * LFB src color comes via combine
+                                                * rgbselect=0 -> iterated = src */
+    regw(REG_alphaMode, 1u | (4u << 1) | (0x40u << 24));  /* alphatest, func>, ref=0x40 */
+    regw(REG_lfbMode, 5u | (1u << 4) | (1u << 8));        /* fmt5 ARGB8888 + pixpipe + draw=back */
+    for (int row = 0; row < 16; row++) {
+        for (int i = 0; i < 32; i++) {
+            /* alpha sweeps 0..0xf8 across the row so the test punches a hole */
+            uint32_t alpha = (uint32_t)(i * 8) & 0xff;
+            uint32_t rgb = 0x0020a0u + ((uint32_t)(row * 8) << 16);
+            uint32_t argb = (alpha << 24) | rgb;
+            wr(lfb_addr1(60 + i, 60 + row), argb, 0xffffffffu);
+        }
+    }
+    regw(REG_alphaMode, 0);
+    regw(REG_lfbMode, 0);
+
+    /* ---- done ---- */
+    mark(0x4f00);
+    regw(REG_swapbufferCMD, 0);
+    rd_nocmp(0);
+
+    end_trace(dir, "m4_pipeline");
+}
+
 /* ---------------- main -------------------------------------------------- */
 
 int main(int argc, char **argv)
@@ -1135,6 +1334,7 @@ int main(int argc, char **argv)
     gen_m1(dir);
     gen_m2(dir);
     gen_m3(dir);
+    gen_m4(dir);
 
     if (G)
         vgold_destroy(G);

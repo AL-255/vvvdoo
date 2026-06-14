@@ -14,7 +14,7 @@ RTL_SRCS := $(RTL_PKG) $(filter-out $(RTL_PKG),$(wildcard rtl/*.sv))
 RTL_CFG  := $(wildcard rtl/*.vlt)
 RTL_TOP  := voodoo_top
 
-.PHONY: all gold traces lint sim test-m1 test-m2 test-m3 test unit clean cosim cosim-run
+.PHONY: all gold traces lint sim test-m1 test-m2 test-m3 test-m4 test unit clean cosim cosim-run
 
 all: gold traces lint sim
 
@@ -65,6 +65,9 @@ test-m2: sim traces
 test-m3: sim traces
 	$(BUILD)/vsim tb/traces/m3_selftest_full.vvt
 
+test-m4: sim traces
+	$(BUILD)/vsim tb/traces/m4_pipeline.vvt
+
 # ---------------- RTL-C co-simulation harness ----------------
 COSIM_FLAGS := --cc --exe --build -O3 -j 0 --top-module $(RTL_TOP) \
                -CFLAGS "-std=c++17 -O2"
@@ -86,7 +89,7 @@ $(BUILD)/unit_%: tb/unit/%.cpp $(BUILD)/libvgold.a
 unit: $(UNIT_BINS)
 	@set -e; for t in $(UNIT_BINS); do echo "== $$t"; $$t; done
 
-test: unit test-m1 test-m2 test-m3
+test: unit test-m1 test-m2 test-m3 test-m4
 
 clean:
 	rm -rf $(BUILD)
