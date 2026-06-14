@@ -33,6 +33,7 @@ module cmd_dispatch
     // regfile snapshot inputs
     input  logic [31:0] fbzmode, fbzcp, alphamode, fogmode, texmode, tlod,
     input  logic [31:0] color0, color1, zacolor, clip_lr, clip_yy,
+    input  logic [31:0] stipple, chromakey, fogcolor,
     input  logic [15:0] vtx_ax, vtx_ay, vtx_bx, vtx_by, vtx_cx, vtx_cy,
     input  logic [31:0] it_startr, it_startg, it_startb, it_starta, it_startz,
     input  logic [31:0] it_drdx, it_dgdx, it_dbdx, it_dadx, it_dzdx,
@@ -273,6 +274,9 @@ module cmd_dispatch
                       tri_q.color0    <= color0;
                       tri_q.color1    <= color1;
                       tri_q.zacolor   <= zacolor;
+                      tri_q.stipple   <= stipple;    // M4
+                      tri_q.chromakey <= chromakey;  // M4
+                      tri_q.fogcolor  <= fogcolor;   // M4
                       tri_q.clip_left   <= eff_left;
                       tri_q.clip_right  <= eff_right;
                       tri_q.clip_top    <= eff_top;

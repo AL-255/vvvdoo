@@ -75,6 +75,28 @@ module pixel_pipe
     input  logic              rsp_valid,
     input  logic [15:0]       rsp_rdata,
 
+    // M4 LFB pixel-pipeline injection (lfbMode bit8). lfb_unit loads ext_tp
+    // (a synthesized tri_params: dest from lfbMode wbufsel, all mode regs) on
+    // ext_load, then pushes expanded src pixels on the ext_px_* channel. Each
+    // pixel carries the 8-bit expanded src ARGB and the 16-bit src depth; the
+    // pipe uses LFB semantics (depthval = sz, iterz = sz<<12, iterw, stipple
+    // reseeded per pixel, no texturing) while ext_active.
+    input  logic        ext_load,       // pulse: latch ext_tp, enter LFB mode
+    input  tri_params_t ext_tp,
+    input  logic        ext_px_valid,
+    output logic        ext_px_ready,
+    input  logic [9:0]  ext_x,
+    input  logic [9:0]  ext_y,
+    input  logic [7:0]  ext_r, ext_g, ext_b, ext_a,
+    input  logic [15:0] ext_sz,
+    input  logic        ext_wsel,        // lfbMode bit14 (write_w_select)
+    output logic        ext_px_done,     // pulse when an ext pixel retires
+
+    // M4 fog-table read port (to voodoo_regfile): idx = fog_depth>>10
+    output logic [5:0]  fog_rd_idx,
+    input  logic [7:0]  fog_rd_blend,
+    input  logic [7:0]  fog_rd_delta,
+
     // M3 TMU sample channel (§11b)
     output logic        smp_valid,
     input  logic        smp_ready,
@@ -180,12 +202,16 @@ module pixel_pipe
   endfunction
 
   // FBI color combine — gold combine_color_full, a verbatim port of MAME
-  // combine_color (mame_voodoo_render.cpp:1511-1729). Returns {a,r,g,b}.
-  // texel is the constant-white M2 stand-in; czh = clamped_z >> 8,
-  // cw = clamped_w (gold combine_color_full cca_localselect cases 2/3).
-  // Chroma-key and alpha-mask tests slot in after c_other selection (M4).
-  function automatic logic [31:0] combine_colorf(
+  // combine_color (mame_voodoo_render.cpp:1511-1729). Returns {discard,a,r,g,b}
+  // (bit 32 = discard). texel is the constant-white M2 stand-in (TMU output in
+  // M3); czh = clamped_z >> 8, cw = clamped_w (cca_localselect cases 2/3).
+  // M4: chroma-key (fbz[1]) test on c_other RGB after rgbselect; alpha-mask
+  // (fbz[13]) test on a_other after aselect. Either failure -> discard.
+  function automatic logic [32:0] combine_colorf(
       input logic [25:0] cp,             // fbzColorPath[25:0] (all bits used)
+      input logic        ck_en,          // fbzMode[1] enable_chromakey
+      input logic        am_en,          // fbzMode[13] enable_alpha_mask
+      input logic [23:0] chromakey,      // chromaKey reg [23:0]
       input logic [31:0] c0v,
       input logic [31:0] c1v,
       input logic [7:0]  itr, input logic [7:0] itg,
@@ -207,7 +233,11 @@ module pixel_pipe
       2'd2:    begin cor = int'(c1v[23:16]); cog = int'(c1v[15:8]); cob = int'(c1v[7:0]); end
       default: begin cor = 0;              cog = 0;              cob = 0;             end
     endcase
-    // (M4: chroma key test goes here)
+    // M4 chroma-key test: basic V1 match on c_other RGB after rgbselect
+    if (ck_en &&
+        (({cor[7:0], cog[7:0], cob[7:0]} ^ chromakey) == 24'h0)) begin
+      return {1'b1, 32'h0};            // discard
+    end
     // c_other A: cc_aselect (cp[3:2])
     unique case (cp[3:2])
       2'd0:    coa = int'(ita);
@@ -215,7 +245,9 @@ module pixel_pipe
       2'd2:    coa = int'(c1v[31:24]);
       default: coa = 0;
     endcase
-    // (M4: alpha mask test goes here)
+    // M4 alpha-mask test: (a_other & 1) == 0 -> discard
+    if (am_en && (coa[0] == 1'b0))
+      return {1'b1, 32'h0};
 
     // c_local RGB: cc_localselect (cp[4]) / cc_localselect_override (cp[7])
     if (!cp[7]) begin
@@ -282,8 +314,63 @@ module pixel_pipe
     // output inverts (cp[25] alpha, cp[16] rgb)
     if (cp[25]) ra = ra ^ 'hff;
     if (cp[16]) begin rr = rr ^ 'hff; rg = rg ^ 'hff; rb = rb ^ 'hff; end
-    return {ra[7:0], rr[7:0], rg[7:0], rb[7:0]};
+    return {1'b0, ra[7:0], rr[7:0], rg[7:0], rb[7:0]};
   endfunction
+
+  // M4 fog — gold apply_fogging (MAME apply_fogging, render.cpp:1896-1981).
+  // Returns the post-fog {r,g,b} (alpha unchanged by fog). The fog-table
+  // blend value is precomputed: tab_blend = fogblend_tab[idx] + deltaval, where
+  // idx and deltaval come from fog_depth (computed at the caller, see PREP).
+  // fogblend is then chosen per fog_zalpha (cases 1/2/3 use iter A / clamped_z
+  // >>8 / clamped_w); case 0 uses tab_blend.
+  /* verilator lint_off UNUSEDSIGNAL */
+  // fogmode[0] (enable_fog) is tested by the caller (P_FOG entry), not here.
+  function automatic logic [23:0] apply_fogf(
+      input logic [5:0]  fogmode,        // fogMode[5:0]; bit0 (enable) unused
+      input logic [23:0] fogcolor,       // fogColor RGB (alpha preserved)
+      input logic [7:0]  cr, input logic [7:0] cg, input logic [7:0] cb,
+      input logic [8:0]  tab_blend,      // fogblend_tab[idx] + deltaval (>=0)
+      input logic [7:0]  itera,
+      input logic [7:0]  czh,            // clamped_z >> 8 (cca path reused)
+      input logic [7:0]  cw);            // clamped_w
+    int fr, fg, fb;
+    int fogblend;
+    logic signed [15:0] sf;
+    fr = int'(fogcolor[23:16]);
+    fg = int'(fogcolor[15:8]);
+    fb = int'(fogcolor[7:0]);
+    if (fogmode[5]) begin                // FOG_constant: bypass
+      if (fogmode[2] == 1'b0) begin      // FOG_mult==0: add color back
+        fr = iclampf(fr + int'(cr), 0, 255);
+        fg = iclampf(fg + int'(cg), 0, 255);
+        fb = iclampf(fb + int'(cb), 0, 255);
+      end
+    end else begin
+      fogblend = 0;
+      if (fogmode[1]) begin fr = 0; fg = 0; fb = 0; end  // FOG_add
+      if (fogmode[2] == 1'b0) begin                       // !FOG_mult: subtract
+        fr = fr - int'(cr); fg = fg - int'(cg); fb = fb - int'(cb);
+      end
+      unique case (fogmode[4:3])         // FOG_zalpha
+        2'd0:    fogblend = int'(tab_blend);
+        2'd1:    fogblend = int'(itera);
+        2'd2:    fogblend = int'(czh);
+        default: fogblend = int'(cw);
+      endcase
+      fogblend = fogblend + 1;
+      sf = 16'(fogblend);
+      fr = iclampf((fr * int'(sf)) >>> 8, 0, 255);
+      fg = iclampf((fg * int'(sf)) >>> 8, 0, 255);
+      fb = iclampf((fb * int'(sf)) >>> 8, 0, 255);
+      if (fogmode[2] == 1'b0) begin       // !FOG_mult: add color back
+        fr = iclampf(fr + int'(cr), 0, 255);
+        fg = iclampf(fg + int'(cg), 0, 255);
+        fb = iclampf(fb + int'(cb), 0, 255);
+      end
+    end
+    return {fr[7:0], fg[7:0], fb[7:0]};
+  endfunction
+  /* verilator lint_on UNUSEDSIGNAL */
 
   // one alpha-blend factor — gold blend_rgb_scale / MAME alpha_blend factor
   // table (mame_voodoo_render.cpp:2009-2117): `other` is the DEST channel for
@@ -307,14 +394,17 @@ module pixel_pipe
     endcase
   endfunction
 
-  // full blend — gold alpha_blend_full (dst alpha = 255 in M2; fog is M4 so
-  // the color-before-fog equals the combine output `src` itself).
+  // full blend — gold alpha_blend_full (dst alpha = 255 this milestone).
   // amf = alphaMode[23:8] (srcrgb/dstrgb/srcalpha/dstalpha factor codes).
+  // M4: prefog is the PRE-fog combine color; the dst factor-15 path
+  // (A_COLORBEFOREFOG) references prefog (not the post-fog src).
   function automatic logic [31:0] alpha_blendf(input logic [15:0] amf,
                                                input logic [31:0] src,
+                                               input logic [23:0] prefog,
                                                input logic [15:0] dstpix);
     logic [23:0] dexp;
     int dr, dg, db, da, sa, sr, sg, sb;
+    int pfr, pfg, pfb;
     int sat, ssr, ssg, ssb, dsr, dsg, dsb, sas, das;
     logic [7:0] rr, rg, rb, ra;
     dexp = unpack565(dstpix);
@@ -322,15 +412,16 @@ module pixel_pipe
     da = 255;
     sa = int'(src[31:24]);
     sr = int'(src[23:16]); sg = int'(src[15:8]); sb = int'(src[7:0]);
+    pfr = int'(prefog[23:16]); pfg = int'(prefog[15:8]); pfb = int'(prefog[7:0]);
     // ASATURATE operand: min(sa, 0x100 - da)
     sat = 'h100 - da;
     if (sa < sat) sat = sa;
     ssr = blend_scalef(amf[3:0],   sa, da, dr, sat);
     ssg = blend_scalef(amf[3:0],   sa, da, dg, sat);
     ssb = blend_scalef(amf[3:0],   sa, da, db, sat);
-    dsr = blend_scalef(amf[7:4],   sa, da, sr, sr);  // prefog == src (fog M4)
-    dsg = blend_scalef(amf[7:4],   sa, da, sg, sg);
-    dsb = blend_scalef(amf[7:4],   sa, da, sb, sb);
+    dsr = blend_scalef(amf[7:4],   sa, da, sr, pfr);  // f15 dst = prefog (M4)
+    dsg = blend_scalef(amf[7:4],   sa, da, sg, pfg);
+    dsb = blend_scalef(amf[7:4],   sa, da, sb, pfb);
     sas = (amf[11:8]  == 4'd4) ? 256 : 0;
     das = (amf[15:12] == 4'd4) ? 256 : 0;
     rr = 8'(iclampf((sr * ssr + dr * dsr) >>> 8, 0, 255));
@@ -348,15 +439,17 @@ module pixel_pipe
   // ----------------------------------------------------------------
   // FSM + per-pixel state
   // ----------------------------------------------------------------
-  typedef enum logic [3:0] {
+  typedef enum logic [4:0] {
     P_IDLE,      // accept a pixel beat
+    P_STIP,      // stipple test (M4); commits the rotate-mode running copy
     P_PREP,      // sy / addresses / OOB / wfloat / depthval / clamped iters
     P_ZREQ,      // issue depth read
     P_ZWAIT,     // wait stored depth, compare
     P_TEXREQ,    // issue TMU sample (texturing only)
     P_TEXWAIT,   // wait tex_valid
     P_COMBINE,   // color combine
-    P_ATEST,     // alpha test + blend routing
+    P_ATEST,     // alpha test
+    P_FOG,       // fog (M4; after alpha test, before blend)
     P_BREQ,      // issue dest read for blend
     P_BWAIT,     // wait dest pixel
     P_BLEND,     // alpha blend
@@ -366,6 +459,16 @@ module pixel_pipe
   } pstate_e;
 
   pstate_e state_q;
+
+  // M4: LFB pixel-pipeline mode (set on ext_load, cleared at tri launch)
+  logic               lfb_mode_q;
+  // running stipple copy (rotate mode mutates across pixels in a primitive;
+  // reseeded from tp_q.stipple at each triangle launch / each LFB pixel)
+  logic [31:0]        stip_q;
+  // LFB-pixel extras latched on accept
+  logic [7:0]         er_q, eg_q, eb_q, ea_q;
+  logic [15:0]        esz_q;
+  logic               ewsel_q;
 
   // latched pixel beat
   logic               last_q;
@@ -387,7 +490,10 @@ module pixel_pipe
   logic [7:0]         ir_q, ig_q, ib_q, ia_q;
   logic [7:0]         czh_q, cw_q;
   logic [31:0]        col_q;            // {a,r,g,b}
+  logic [31:0]        prefog_q;         // pre-fog combine color (blend f15 dst)
   logic [15:0]        dpix_q;
+  logic [8:0]         fog_tab_q;        // fogblend_tab[idx] + deltaval (latched)
+  logic [7:0]         ia_pre_q;         // iterated alpha for fog (gold iter.a)
 
   // ----------------------------------------------------------------
   // P_PREP combinational stage
@@ -400,6 +506,11 @@ module pixel_pipe
   logic [15:0]        prep_wfloat, prep_cz;
   logic signed [17:0] prep_dv;
   logic [15:0]        prep_depthval;
+  // M4 fog-table depth/index and table blend
+  logic signed [17:0] prep_fogdepth;
+  logic [15:0]        prep_fogdepth_c;     // clamped 0..0xffff
+  logic [15:0]        prep_deltaval;       // (delta&0xff)*((depth>>2)&0xff)>>6>>4
+  logic [8:0]         prep_tab_blend;
 
   always_comb begin
     // 1) y-origin flip (fbzMode[17]; CONTRACTS §9.5 effective yorigin)
@@ -414,25 +525,54 @@ module pixel_pipe
     prep_dest_ok = prep_sy_ok && (prep_dword[22:21] == 2'b00);
     prep_aux_ok  = prep_sy_ok && (prep_aword[22:21] == 2'b00);
 
-    // out-of-clip-rect beat = the raster's zero-pixel dummy: discard
-    prep_off = (x_q < tp_q.clip_left) || (x_q >= tp_q.clip_right) ||
-               (y_q < tp_q.clip_top)  || (y_q >= tp_q.clip_bottom);
+    // out-of-clip-rect beat = the raster's zero-pixel dummy: discard.
+    // LFB pixel-pipeline writes are not clipped (gold lfb_pixel_pipeline).
+    prep_off = ~lfb_mode_q &&
+               ((x_q < tp_q.clip_left) || (x_q >= tp_q.clip_right) ||
+                (y_q < tp_q.clip_top)  || (y_q >= tp_q.clip_bottom));
 
-    // 2) wfloat, 3) depth value (gold pixel_pipe steps 1-2)
+    // 2) wfloat, 3) depth value (gold pixel_pipe steps 1-2). In LFB mode the
+    // depth value is the src depth directly (no wbuffer/clamp/bias) and the
+    // fog "wfloat" is that same depth (gold lfb_pixel_pipeline).
     prep_wfloat = wfloatf(w_q[47:0]);
     prep_cz     = clamped_zf(z_q, tp_q.fbzcp[28]);
-    prep_dv     = tp_q.fbzmode[3] ? $signed({2'b00, prep_wfloat})
-                                  : $signed({2'b00, prep_cz});
-    if (tp_q.fbzmode[16]) begin
-      // depth bias: += sext16(zaColor[15:0]), clamp [0,0xffff]
-      prep_dv = prep_dv
-              + $signed({{2{tp_q.zacolor[15]}}, tp_q.zacolor[15:0]});
-      if (prep_dv < 18'sd0)
-        prep_dv = 18'sd0;
-      else if (prep_dv > 18'sd65535)
-        prep_dv = 18'sd65535;
+    if (lfb_mode_q) begin
+      prep_dv       = $signed({2'b00, esz_q});
+      prep_depthval = esz_q;
+    end else begin
+      prep_dv     = tp_q.fbzmode[3] ? $signed({2'b00, prep_wfloat})
+                                    : $signed({2'b00, prep_cz});
+      if (tp_q.fbzmode[16]) begin
+        // depth bias: += sext16(zaColor[15:0]), clamp [0,0xffff]
+        prep_dv = prep_dv
+                + $signed({{2{tp_q.zacolor[15]}}, tp_q.zacolor[15:0]});
+        if (prep_dv < 18'sd0)
+          prep_dv = 18'sd0;
+        else if (prep_dv > 18'sd65535)
+          prep_dv = 18'sd65535;
+      end
+      prep_depthval = prep_dv[15:0];
     end
-    prep_depthval = prep_dv[15:0];
+
+    // M4 fog-table depth (gold apply_fogging zalpha==0): fog_depth = wfloat
+    // (triangle) or depthval (LFB), with depthbias clamp if fbzMode[16].
+    prep_fogdepth = lfb_mode_q ? $signed({2'b00, esz_q})
+                               : $signed({2'b00, prep_wfloat});
+    if (tp_q.fbzmode[16]) begin
+      prep_fogdepth = prep_fogdepth
+                    + $signed({{2{tp_q.zacolor[15]}}, tp_q.zacolor[15:0]});
+      if (prep_fogdepth < 18'sd0)
+        prep_fogdepth = 18'sd0;
+      else if (prep_fogdepth > 18'sd65535)
+        prep_fogdepth = 18'sd65535;
+    end
+    prep_fogdepth_c = prep_fogdepth[15:0];
+    // index = (fog_depth>>10) & 0x3f
+    fog_rd_idx = prep_fogdepth_c[15:10];
+    // deltaval = (delta&0xff)*((fog_depth>>2)&0xff); >>6; >>4
+    prep_deltaval = 16'(((16'(fog_rd_delta) * 16'({8'b0, prep_fogdepth_c[9:2]}))
+                         >> 6) >> 4);
+    prep_tab_blend = 9'({1'b0, fog_rd_blend} + prep_deltaval);
   end
 
   // ----------------------------------------------------------------
@@ -480,8 +620,13 @@ module pixel_pipe
     endcase
   end
 
-  assign px_ready = (state_q == P_IDLE);
-  assign tri_done = (state_q == P_RETIRE) & last_q;
+  // accept triangle pixels only when NOT in LFB mode; accept ext pixels only
+  // when in LFB mode (the two sources are temporally disjoint: cmd_dispatch
+  // serializes triangle launches vs LFB writes).
+  assign px_ready     = (state_q == P_IDLE) & ~lfb_mode_q;
+  assign ext_px_ready = (state_q == P_IDLE) &  lfb_mode_q;
+  assign tri_done     = (state_q == P_RETIRE) & last_q & ~lfb_mode_q;
+  assign ext_px_done  = (state_q == P_RETIRE) &  lfb_mode_q;
 
   // TMU sample channel: request in P_TEXREQ, accept response in P_TEXWAIT
   assign smp_valid = (state_q == P_TEXREQ);
@@ -512,19 +657,35 @@ module pixel_pipe
       czh_q       <= '0;
       cw_q        <= '0;
       col_q       <= '0;
+      prefog_q    <= '0;
       dpix_q      <= '0;
+      fog_tab_q   <= '0;
+      ia_pre_q    <= '0;
       pixout_inc  <= 1'b0;
+      lfb_mode_q  <= 1'b0;
+      stip_q      <= '0;
+      er_q <= '0; eg_q <= '0; eb_q <= '0; ea_q <= '0;
+      esz_q <= '0; ewsel_q <= 1'b0;
     end else begin
       pixout_inc <= 1'b0;
 
-      // pipe owns the tri_params latch (§7.2)
-      if (tri_valid && tri_ready)
-        tp_q <= tri_params;
+      // pipe owns the tri_params latch (§7.2). A triangle launch reseeds the
+      // running stipple from the register and clears LFB mode. An ext_load
+      // (LFB pixel-pipeline) latches the synthesized params and enters LFB
+      // mode. The two are serialized by cmd_dispatch (never the same cycle).
+      if (tri_valid && tri_ready) begin
+        tp_q       <= tri_params;
+        stip_q     <= tri_params.stipple;
+        lfb_mode_q <= 1'b0;
+      end else if (ext_load) begin
+        tp_q       <= ext_tp;
+        lfb_mode_q <= 1'b1;
+      end
 
       unique case (state_q)
         // ------------------------------------------------------------
         P_IDLE: begin
-          if (px_valid) begin
+          if (px_valid && ~lfb_mode_q) begin
             last_q <= px_last;
             x_q    <= px_x;
             y_q    <= px_y;
@@ -538,6 +699,42 @@ module pixel_pipe
             t0_q   <= px_t0;
             w0_q   <= px_w0;
             texel_q <= 32'hffffffff;     // M2 constant white; TMU overwrites
+            state_q <= P_STIP;
+          end else if (ext_px_valid && lfb_mode_q) begin
+            last_q <= 1'b0;              // ext pixels retire individually
+            x_q    <= ext_x;
+            y_q    <= ext_y;
+            er_q   <= ext_r; eg_q <= ext_g; eb_q <= ext_b; ea_q <= ext_a;
+            esz_q  <= ext_sz;
+            ewsel_q <= ext_wsel;
+            texel_q <= 32'hffffffff;     // no texturing on LFB writes
+            // reseed stipple from the register for each LFB pixel (gold)
+            stip_q  <= ext_tp.stipple;
+            state_q <= P_STIP;
+          end
+        end
+
+        // ------------------------------------------------------------
+        // M4 stipple test (gold pixel_pipe / lfb_pixel_pipeline step 1)
+        P_STIP: begin
+          // sy for the pattern index uses the post-flip row
+          if (tp_q.fbzmode[2]) begin
+            if (tp_q.fbzmode[12]) begin
+              // pattern mode: idx = ((sy&3)<<3) | (~x & 7)
+              if (((stip_q >> {prep_sy[1:0], ~x_q[2:0]}) & 32'd1) == 32'd0)
+                state_q <= P_RETIRE;       // stipple discard
+              else
+                state_q <= P_PREP;
+            end else begin
+              // rotate mode: stipple = rotr32(stipple,1); discard if top clear.
+              // The rotate commits regardless of the later discard (gold).
+              stip_q <= {stip_q[0], stip_q[31:1]};
+              if (stip_q[0] == 1'b0)       // post-rotate bit31 == pre-rotate[0]
+                state_q <= P_RETIRE;
+              else
+                state_q <= P_PREP;
+            end
+          end else begin
             state_q <= P_PREP;
           end
         end
@@ -552,13 +749,28 @@ module pixel_pipe
           depthval_q  <= prep_depthval;
           // depth_source_compare (fbzMode[20]): u16 zaColor
           depthsrc_q  <= tp_q.fbzmode[20] ? tp_q.zacolor[15:0] : prep_depthval;
-          // 4) iterated ARGB clamp (gold clamp_argb_chan)
-          ir_q <= clamp_argbf(r_q[23:12], tp_q.fbzcp[28]);
-          ig_q <= clamp_argbf(g_q[23:12], tp_q.fbzcp[28]);
-          ib_q <= clamp_argbf(b_q[23:12], tp_q.fbzcp[28]);
-          ia_q <= clamp_argbf(a_q[23:12], tp_q.fbzcp[28]);
-          czh_q <= prep_cz[15:8];
-          cw_q  <= clamped_wf(w_q[47:32], tp_q.fbzcp[28]);
+          // 4) iterated ARGB: clamp (triangle) or the expanded LFB src (LFB).
+          // For the cca_localselect Z/W paths and fog, iterz/iterw differ in
+          // LFB mode (sz<<12, sz<<16 or za<<16) — captured via czh_q/cw_q.
+          if (lfb_mode_q) begin
+            ir_q <= er_q; ig_q <= eg_q; ib_q <= eb_q; ia_q <= ea_q;
+            // clamped_z(sz<<12)>>8 ; clamped_w(ewsel?za<<16:sz<<16)
+            czh_q <= clamped_zf(32'($signed({esz_q, 12'b0})), tp_q.fbzcp[28])[15:8];
+            // LFB iterw = (uint32)(sz<<16) or (uint32)(za<<16): bits[47:32]=0,
+            // so clamped_w reads 0 (gold lfb_pixel_pipeline).
+            cw_q  <= clamped_wf(16'h0, tp_q.fbzcp[28]);
+            ia_pre_q <= 8'h00;            // fog itera = 0 (gold)
+          end else begin
+            ir_q <= clamp_argbf(r_q[23:12], tp_q.fbzcp[28]);
+            ig_q <= clamp_argbf(g_q[23:12], tp_q.fbzcp[28]);
+            ib_q <= clamp_argbf(b_q[23:12], tp_q.fbzcp[28]);
+            ia_q <= clamp_argbf(a_q[23:12], tp_q.fbzcp[28]);
+            czh_q <= prep_cz[15:8];
+            cw_q  <= clamped_wf(w_q[47:32], tp_q.fbzcp[28]);
+            ia_pre_q <= clamp_argbf(a_q[23:12], tp_q.fbzcp[28]);
+          end
+          // fog: latch the precomputed table blend value (idx from fog_depth)
+          fog_tab_q <= prep_tab_blend;
           if (prep_off)
             state_q <= P_RETIRE;          // raster's zero-pixel dummy beat
           else if (tp_q.fbzmode[4] && tp_q.aux_valid && prep_aux_ok)
@@ -594,24 +806,46 @@ module pixel_pipe
 
         // ------------------------------------------------------------
         P_COMBINE: begin
-          // 5) color combine; texel = TMU output (M3) or white (M2 path)
-          col_q <= combine_colorf(tp_q.fbzcp[25:0], tp_q.color0, tp_q.color1,
-                                  ir_q, ig_q, ib_q, ia_q,
-                                  texel_q[23:16], texel_q[15:8],
-                                  texel_q[7:0], texel_q[31:24],
-                                  czh_q, cw_q);
-          // (M4: chroma key / alpha mask / stipple / fog slot in after this)
-          state_q <= P_ATEST;
+          // 5) color combine; texel = TMU output (M3) or white. M4 chroma key
+          // / alpha mask are inside combine_colorf and signal discard (bit 32).
+          begin
+            logic [32:0] cc;
+            cc = combine_colorf(tp_q.fbzcp[25:0],
+                                tp_q.fbzmode[1], tp_q.fbzmode[13],
+                                tp_q.chromakey[23:0],
+                                tp_q.color0, tp_q.color1,
+                                ir_q, ig_q, ib_q, ia_q,
+                                texel_q[23:16], texel_q[15:8],
+                                texel_q[7:0], texel_q[31:24],
+                                czh_q, cw_q);
+            col_q <= cc[31:0];
+            state_q <= cc[32] ? P_RETIRE : P_ATEST;   // chroma/alpha-mask fail
+          end
         end
 
         P_ATEST: begin
           // 6) alpha test (alphaMode[0]; func [3:1]; ref [31:24])
+          prefog_q <= col_q;              // pre-fog color (blend f15 dst path)
           if (tp_q.alphamode[0] &&
               !cmp_pass(tp_q.alphamode[3:1],
                         {9'b0, col_q[31:24]}, {9'b0, tp_q.alphamode[31:24]}))
             state_q <= P_RETIRE;          // alpha-fail discard
-          else if (tp_q.alphamode[4]) begin
-            // 7) alpha blend: dest pixel reads as 0 when OOB (gold)
+          else
+            state_q <= P_FOG;             // 7) fog (after alpha test)
+        end
+
+        // ------------------------------------------------------------
+        // M4 fog (gold apply_fogging). Alpha preserved; rgb replaced.
+        P_FOG: begin
+          if (tp_q.fogmode[0]) begin      // FOG_enable
+            logic [23:0] fc;
+            fc = apply_fogf(tp_q.fogmode[5:0], tp_q.fogcolor[23:0],
+                            col_q[23:16], col_q[15:8], col_q[7:0],
+                            fog_tab_q, ia_pre_q, czh_q, cw_q);
+            col_q <= {col_q[31:24], fc};
+          end
+          // 8) alpha blend routing (dest pixel reads as 0 when OOB, gold)
+          if (tp_q.alphamode[4]) begin
             if (dest_ok_q)
               state_q <= P_BREQ;
             else begin
@@ -634,7 +868,8 @@ module pixel_pipe
         end
 
         P_BLEND: begin
-          col_q      <= alpha_blendf(tp_q.alphamode[23:8], col_q, dpix_q);
+          col_q      <= alpha_blendf(tp_q.alphamode[23:8], col_q,
+                                     prefog_q[23:0], dpix_q);
           pixout_inc <= 1'b1;             // pixel reaches the write stage
           state_q    <= P_WCOLOR;
         end
@@ -667,12 +902,15 @@ module pixel_pipe
                          tp_q.s0, tp_q.ds0dx, tp_q.ds0dy,
                          tp_q.t0, tp_q.dt0dx, tp_q.dt0dy,
                          tp_q.w0, tp_q.dw0dx, tp_q.dw0dy,
-                         tp_q.fogmode, tp_q.tlod,
+                         tp_q.tlod,
                          tp_q.fbzmode[31:21], tp_q.fbzmode[19],
-                         tp_q.fbzmode[15:12], tp_q.fbzmode[2:0],
+                         tp_q.fbzmode[15:14], tp_q.fbzmode[0],
                          tp_q.fbzcp[31:29], tp_q.fbzcp[27:26],
                          tp_q.alphamode[7:5],
                          tp_q.zacolor[31:16],
+                         tp_q.chromakey[31:24], tp_q.fogcolor[31:24],
+                         tp_q.stipple,    // stip seeded from tri_params/ext_tp
+                         ewsel_q, prep_fogdepth_c[1:0], prefog_q[31:24],
                          r_q[31:24], r_q[11:0], g_q[31:24], g_q[11:0],
                          b_q[31:24], b_q[11:0], a_q[31:24], a_q[11:0],
                          z_q[11:0], w_q[63:48], w_q[31:0]};

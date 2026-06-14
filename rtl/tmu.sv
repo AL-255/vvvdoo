@@ -639,6 +639,7 @@ module tmu
                     tp_q.fbzmode, tp_q.fbzcp,
                     tp_q.alphamode, tp_q.fogmode,
                     tp_q.color0, tp_q.color1, tp_q.zacolor,
+                    tp_q.stipple, tp_q.chromakey, tp_q.fogcolor,
                     tp_q.clip_left, tp_q.clip_right, tp_q.clip_top,
                     tp_q.clip_bottom, tp_q.dest_base, tp_q.aux_base,
                     tp_q.aux_valid, tp_q.rowpixels, tp_q.yorigin};

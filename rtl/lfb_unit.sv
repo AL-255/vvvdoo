@@ -36,6 +36,28 @@ module lfb_unit
     input  logic [1:0]  frontbuf,
     input  logic [1:0]  backbuf,
 
+    // M4: extra mode regs for the LFB pixel-pipeline path (lfbMode bit8)
+    input  logic [31:0] fbzcp,
+    input  logic [31:0] alphamode,
+    input  logic [31:0] fogmode,
+    input  logic [31:0] color0,
+    input  logic [31:0] color1,
+    input  logic [31:0] chromakey,
+    input  logic [31:0] fogcolor,
+    input  logic [31:0] stipple,
+
+    // M4: pixel-pipeline injection channel into pixel_pipe (lfbMode bit8)
+    output logic        pp_ext_load,
+    output tri_params_t pp_ext_tp,
+    output logic        pp_ext_px_valid,
+    input  logic        pp_ext_px_ready,
+    output logic [9:0]  pp_ext_x,
+    output logic [9:0]  pp_ext_y,
+    output logic [7:0]  pp_ext_r, pp_ext_g, pp_ext_b, pp_ext_a,
+    output logic [15:0] pp_ext_sz,
+    output logic        pp_ext_wsel,
+    input  logic        pp_ext_px_done,
+
     // fb_arb client 0 port (§7.3)
     output logic              req_valid,
     input  logic              req_ready,
@@ -307,17 +329,52 @@ module lfb_unit
   end
 
   // ----------------------------------------------------------------
+  // M4 LFB pixel-pipeline (lfbMode bit8): synthesize a tri_params with the
+  // mode-register snapshot + LFB dest/aux and push the expanded src pixels.
+  // gold lfb_pixel_pipeline uses the UNFLIPPED row y (pixel_pipe flips it via
+  // fbzMode[17]); present-pixel selection uses the post-wbe present mask pm.
+  // ----------------------------------------------------------------
+  logic        pp_path;        // this write uses the pixel pipeline
+  logic        pix0_present, pix1_present;
+  tri_params_t ext_tp_c;
+  always_comb begin
+    pp_path      = lfbmode[8];
+    pix0_present = |pm[3:0];
+    pix1_present = |pm[6:4];
+
+    ext_tp_c           = '0;
+    ext_tp_c.fbzmode   = fbzmode;
+    ext_tp_c.fbzcp     = fbzcp;
+    ext_tp_c.alphamode = alphamode;
+    ext_tp_c.fogmode   = fogmode;
+    ext_tp_c.texmode   = 32'd0;          // no texturing on LFB writes
+    ext_tp_c.color0    = color0;
+    ext_tp_c.color1    = color1;
+    ext_tp_c.zacolor   = zacolor;
+    ext_tp_c.chromakey = chromakey;
+    ext_tp_c.fogcolor  = fogcolor;
+    ext_tp_c.stipple   = stipple;
+    ext_tp_c.dest_base = base_sel;       // LFB wbufsel (lfbMode[5:4])
+    ext_tp_c.aux_base  = auxoffs_w;
+    ext_tp_c.aux_valid = auxoffs_valid;
+    ext_tp_c.rowpixels = rowpixels;
+    ext_tp_c.yorigin   = yor_eff;
+  end
+
+  // ----------------------------------------------------------------
   // FSM
   // ----------------------------------------------------------------
   typedef enum logic [3:0] {
     L_IDLE, L_WSET, L_P0C, L_P0A, L_P1C, L_P1A, L_FIN,
-    L_RSET, L_RREQ0, L_RW0, L_RREQ1, L_RW1, L_RFIN
+    L_RSET, L_RREQ0, L_RW0, L_RREQ1, L_RW1, L_RFIN,
+    L_PPLOAD, L_PP0, L_PP1
   } lstate_e;
 
   lstate_e     state_q;
   logic [15:0] p0_q;
   logic [31:0] rdata_q;
   logic [1:0]  pixout_q;
+  logic        pp_acc_q;       // current ext pixel has been accepted by pipe
 
   // assembled read dword with read swaps (word_swap_reads bit15,
   // byte_swizzle_reads bit16, in that order, per MAME internal_lfb_r)
@@ -340,8 +397,17 @@ module lfb_unit
       p0_q     <= '0;
       rdata_q  <= '0;
       pixout_q <= 2'd0;
+      pp_acc_q <= 1'b0;
     end else begin
       pixout_q <= 2'd0;
+      // clear the per-pixel accept latch when entering a fresh push state
+      if (state_q == L_PPLOAD)
+        pp_acc_q <= 1'b0;
+      else if ((state_q == L_PP0 || state_q == L_PP1) &&
+               pp_ext_px_valid && pp_ext_px_ready)
+        pp_acc_q <= 1'b1;
+      if (pp_ext_px_done)
+        pp_acc_q <= 1'b0;
       unique case (state_q)
         L_IDLE: begin
           if (wr_valid) begin
@@ -356,12 +422,15 @@ module lfb_unit
             state_q <= L_RSET;
           end
         end
-        // ---- raw write sequence ----
+        // ---- write sequence ----
         L_WSET: begin
           if (!base_valid) begin
             state_q <= L_FIN;      // no dest buffer: whole write dropped
+          end else if (pp_path) begin
+            // M4 pixel-pipeline path: pixel_pipe counts fbiPixelsOut itself
+            state_q <= L_PPLOAD;
           end else begin
-            // fbiPixelsOut: once per present pixel slot regardless of masks
+            // raw path. fbiPixelsOut: once per present pixel slot (any mask)
             pixout_q <= {1'b0, |pm[3:0]} + {1'b0, |pm[6:4]};
             state_q  <= L_P0C;
           end
@@ -371,6 +440,14 @@ module lfb_unit
         L_P1C: if (!w1c || req_ready) state_q <= L_P1A;
         L_P1A: if (!w1a || req_ready) state_q <= L_FIN;
         L_FIN: state_q <= L_IDLE;
+        // ---- M4 pixel-pipeline write sequence ----
+        // L_PPLOAD pulses pp_ext_load (latches ext_tp & sets LFB mode in the
+        // pipe), then push present pixel 0, then present pixel 1, each waiting
+        // for the pipe to retire it (pp_ext_px_done) before advancing.
+        L_PPLOAD: state_q <= pix0_present ? L_PP0
+                           : (pix1_present ? L_PP1 : L_FIN);
+        L_PP0: if (pp_ext_px_done) state_q <= pix1_present ? L_PP1 : L_FIN;
+        L_PP1: if (pp_ext_px_done) state_q <= L_FIN;
         // ---- read sequence ----
         L_RSET: begin
           if (!base_valid || !sy_ok || addr0c[21] || addr1c[21]) begin
@@ -393,6 +470,22 @@ module lfb_unit
   // ----------------------------------------------------------------
   // outputs
   // ----------------------------------------------------------------
+  // M4 pixel-pipeline injection drive
+  always_comb begin
+    pp_ext_load     = (state_q == L_PPLOAD);
+    pp_ext_tp       = ext_tp_c;
+    pp_ext_px_valid = ((state_q == L_PP0) || (state_q == L_PP1)) & ~pp_acc_q;
+    // pixel 1 (x+1) uses col1/d1; pixel 0 uses col0/d0 (gold col[(xx-x)&1])
+    pp_ext_x    = (state_q == L_PP1) ? px_x1[9:0] : px_x0[9:0];
+    pp_ext_y    = py;                    // unflipped row (pipe flips it)
+    pp_ext_r    = (state_q == L_PP1) ? r1 : r0;
+    pp_ext_g    = (state_q == L_PP1) ? g1 : g0;
+    pp_ext_b    = (state_q == L_PP1) ? b1 : b0;
+    pp_ext_a    = (state_q == L_PP1) ? a1 : a0;
+    pp_ext_sz   = (state_q == L_PP1) ? d1 : d0;
+    pp_ext_wsel = lfbmode[14];
+  end
+
   always_comb begin
     req_valid = 1'b0;
     req_we    = 1'b0;
@@ -429,11 +522,12 @@ module lfb_unit
   assign pixout_cnt = pixout_q;
 
   // intentionally unused input bits / intermediate bits:
-  // lfbmode[8] = pixel-pipeline LFB path is raw until M4 (CONTRACTS §9.10);
-  // off21[20] dropped by the y &= 0x3ff rule; px_x1 only feeds the dither x.
+  // off21[20] dropped by the y &= 0x3ff rule; px_x1 high bits only feed dither.
+  // The LFB raw path consumes only a subset of fbzmode/zacolor; the rest are
+  // forwarded verbatim into ext_tp for the pixel-pipeline path.
   logic unused_in;
-  assign unused_in = &{1'b0, lfbmode[31:17], lfbmode[14], lfbmode[8],
+  assign unused_in = &{1'b0, lfbmode[31:17],
                        fbzmode[31:19], fbzmode[17:12], fbzmode[10:9],
-                       fbzmode[7:0], zacolor[23:16], off21[20], px_x1[10:2]};
+                       fbzmode[7:0], zacolor[23:16], off21[20], px_x1[10]};
 
 endmodule

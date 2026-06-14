@@ -112,6 +112,8 @@ package voodoo_pkg;
     // mode register snapshot
     logic [31:0] fbzmode, fbzcp, alphamode, fogmode, texmode, tlod;
     logic [31:0] color0, color1, zacolor;
+    // M4: stipple register (0x50) and chromaKey (0x4d) and fogColor (0x4b)
+    logic [31:0] stipple, chromakey, fogcolor;
     // effective clip rect, pixels; right/bottom exclusive
     logic [9:0]  clip_left, clip_right, clip_top, clip_bottom;
     // resolved buffers & layout (16-bit-word offsets into fb_ram)

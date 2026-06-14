@@ -35,6 +35,11 @@ module voodoo_regfile
     output logic        dec_swizzle_en,   // fbiInit0 bit 3
     output logic        dec_alias_en,     // fbiInit3 bit 0
 
+    // M4 fog-table read port (pixel_pipe drives idx, gets {blend,delta})
+    input  logic [5:0]  fog_rd_idx,
+    output logic [7:0]  fog_rd_blend,
+    output logic [7:0]  fog_rd_delta,
+
     // live register values (snapshot consumers: dispatch/lfb/fastfill/tex_dl)
     output logic [31:0] fbzmode,
     output logic [31:0] fbzcp,
@@ -49,6 +54,9 @@ module voodoo_regfile
     output logic [31:0] clip_lr,
     output logic [31:0] clip_yy,
     output logic [31:0] texbaseaddr,
+    output logic [31:0] stipple,    // M4 reg 0x50
+    output logic [31:0] chromakey,  // M4 reg 0x4d
+    output logic [31:0] fogcolor,   // M4 reg 0x4b
 
     // raw vertex / iterator registers
     output logic [15:0] vtx_ax, vtx_ay, vtx_bx, vtx_by, vtx_cx, vtx_cy,
@@ -91,6 +99,19 @@ module voodoo_regfile
 
   logic [7:0] dac_regs [0:7];
   logic [7:0] dac_rd_q;
+
+  // M4 fog tables (MAME m_fogblend/m_fogdelta), 64 u8 entries each. A write to
+  // fogTable index k (regnum 0x58..0x77) sets base = 2*(k - 0x58):
+  //   fogdelta[base]=data[7:0]; fogblend[base]=data[15:8];
+  //   fogdelta[base+1]=data[23:16]; fogblend[base+1]=data[31:24].
+  logic [7:0] fogblend_q [0:63];
+  logic [7:0] fogdelta_q [0:63];
+  logic       is_fogtable;
+  logic [5:0] fog_base;
+  always_comb begin
+    is_fogtable = (wr_regnum >= REG_FOGTABLE) && (wr_regnum <= 8'h77);
+    fog_base    = {(wr_regnum[4:0] - REG_FOGTABLE[4:0]), 1'b0};
+  end
 
   // ----------------------------------------------------------------
   // write-path classification (voodoo_soft.c soft_reg_write)
@@ -206,6 +227,10 @@ module voodoo_regfile
       for (int i = 0; i < 8; i++)
         dac_regs[i] <= 8'h0;
       dac_rd_q <= 8'h0;
+      for (int i = 0; i < 64; i++) begin
+        fogblend_q[i] <= 8'h0;
+        fogdelta_q[i] <= 8'h0;
+      end
     end else begin
       // fbiPixelsOut accumulation (serialized: never concurrent with a
       // dispatch write to the same register; a wr_en write below wins)
@@ -277,6 +302,14 @@ module voodoo_regfile
             default: regs[wr_regnum] <= wr_data;
           endcase
         end
+        // M4 fogTable decode (parallel to the reg store above; gold reg_write
+        // also keeps g->regs[regnum]=data so the default branch covers that).
+        if (is_fogtable) begin
+          fogdelta_q[fog_base]              <= wr_data[7:0];
+          fogblend_q[fog_base]              <= wr_data[15:8];
+          fogdelta_q[fog_base + 6'd1]       <= wr_data[23:16];
+          fogblend_q[fog_base + 6'd1]       <= wr_data[31:24];
+        end
       end
 
       if (swap_en) begin
@@ -327,6 +360,13 @@ module voodoo_regfile
   assign clip_lr     = regs[REG_CLIPLEFTRIGHT];
   assign clip_yy     = regs[REG_CLIPLOWYHIGHY];
   assign texbaseaddr = regs[REG_TEXBASEADDR];
+  assign stipple     = regs[REG_STIPPLE];
+  assign chromakey   = regs[REG_CHROMAKEY];
+  assign fogcolor    = regs[REG_FOGCOLOR];
+
+  // M4 fog-table read port (combinational; pixel_pipe latches the result)
+  assign fog_rd_blend = fogblend_q[fog_rd_idx];
+  assign fog_rd_delta = fogdelta_q[fog_rd_idx];
 
   assign vtx_ax = regs[REG_VERTEXAX][15:0];
   assign vtx_ay = regs[REG_VERTEXAY][15:0];

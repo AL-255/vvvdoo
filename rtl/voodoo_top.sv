@@ -56,6 +56,10 @@ module voodoo_top
   logic [31:0] r_fbzmode, r_fbzcp, r_alphamode, r_fogmode, r_texmode, r_tlod;
   logic [31:0] r_lfbmode, r_color0, r_color1, r_zacolor, r_clip_lr, r_clip_yy;
   logic [31:0] r_texbaseaddr;
+  logic [31:0] r_stipple, r_chromakey, r_fogcolor;
+  // M4 fog-table read port (pixel_pipe -> regfile)
+  logic [5:0]  fog_rd_idx;
+  logic [7:0]  fog_rd_blend, fog_rd_delta;
   logic [15:0] r_vtx_ax, r_vtx_ay, r_vtx_bx, r_vtx_by, r_vtx_cx, r_vtx_cy;
   logic [31:0] r_startr, r_startg, r_startb, r_starta, r_startz;
   logic [31:0] r_drdx, r_dgdx, r_dbdx, r_dadx, r_dzdx;
@@ -101,6 +105,14 @@ module voodoo_top
   logic signed [31:0] px_r, px_g, px_b, px_a, px_z;
   logic signed [63:0] px_w, px_s0, px_t0, px_w0;
   logic        pp_pixout_inc;
+
+  // M4 LFB pixel-pipeline injection (lfb_unit -> pixel_pipe)
+  logic        pp_ext_load, pp_ext_px_valid, pp_ext_px_ready, pp_ext_px_done;
+  tri_params_t pp_ext_tp;
+  logic [9:0]  pp_ext_x, pp_ext_y;
+  logic [7:0]  pp_ext_r, pp_ext_g, pp_ext_b, pp_ext_a;
+  logic [15:0] pp_ext_sz;
+  logic        pp_ext_wsel;
 
   // pixel_pipe <-> tmu sample channel (§11b)
   logic        smp_valid, smp_ready, tex_valid, tex_ready;
@@ -194,6 +206,9 @@ module voodoo_top
       .pixout_inc_pipe (pp_pixout_inc),
       .dec_swizzle_en  (dec_swizzle_en),
       .dec_alias_en    (dec_alias_en),
+      .fog_rd_idx      (fog_rd_idx),
+      .fog_rd_blend    (fog_rd_blend),
+      .fog_rd_delta    (fog_rd_delta),
       .fbzmode         (r_fbzmode),
       .fbzcp           (r_fbzcp),
       .alphamode       (r_alphamode),
@@ -207,6 +222,9 @@ module voodoo_top
       .clip_lr         (r_clip_lr),
       .clip_yy         (r_clip_yy),
       .texbaseaddr     (r_texbaseaddr),
+      .stipple         (r_stipple),
+      .chromakey       (r_chromakey),
+      .fogcolor        (r_fogcolor),
       .vtx_ax          (r_vtx_ax),
       .vtx_ay          (r_vtx_ay),
       .vtx_bx          (r_vtx_bx),
@@ -282,6 +300,9 @@ module voodoo_top
       .zacolor        (r_zacolor),
       .clip_lr        (r_clip_lr),
       .clip_yy        (r_clip_yy),
+      .stipple        (r_stipple),
+      .chromakey      (r_chromakey),
+      .fogcolor       (r_fogcolor),
       .vtx_ax         (r_vtx_ax),
       .vtx_ay         (r_vtx_ay),
       .vtx_bx         (r_vtx_bx),
@@ -386,6 +407,27 @@ module voodoo_top
       .auxoffs_valid (r_auxoffs_valid),
       .frontbuf      (r_frontbuf),
       .backbuf       (r_backbuf),
+      .fbzcp         (r_fbzcp),
+      .alphamode     (r_alphamode),
+      .fogmode       (r_fogmode),
+      .color0        (r_color0),
+      .color1        (r_color1),
+      .chromakey     (r_chromakey),
+      .fogcolor      (r_fogcolor),
+      .stipple       (r_stipple),
+      .pp_ext_load     (pp_ext_load),
+      .pp_ext_tp       (pp_ext_tp),
+      .pp_ext_px_valid (pp_ext_px_valid),
+      .pp_ext_px_ready (pp_ext_px_ready),
+      .pp_ext_x        (pp_ext_x),
+      .pp_ext_y        (pp_ext_y),
+      .pp_ext_r        (pp_ext_r),
+      .pp_ext_g        (pp_ext_g),
+      .pp_ext_b        (pp_ext_b),
+      .pp_ext_a        (pp_ext_a),
+      .pp_ext_sz       (pp_ext_sz),
+      .pp_ext_wsel     (pp_ext_wsel),
+      .pp_ext_px_done  (pp_ext_px_done),
       .req_valid     (c0_req_valid),
       .req_ready     (c0_req_ready),
       .req_we        (c0_req_we),
@@ -500,6 +542,22 @@ module voodoo_top
       .px_t0      (px_t0),
       .px_w0      (px_w0),
       .tri_done   (tri_done),
+      .ext_load     (pp_ext_load),
+      .ext_tp       (pp_ext_tp),
+      .ext_px_valid (pp_ext_px_valid),
+      .ext_px_ready (pp_ext_px_ready),
+      .ext_x        (pp_ext_x),
+      .ext_y        (pp_ext_y),
+      .ext_r        (pp_ext_r),
+      .ext_g        (pp_ext_g),
+      .ext_b        (pp_ext_b),
+      .ext_a        (pp_ext_a),
+      .ext_sz       (pp_ext_sz),
+      .ext_wsel     (pp_ext_wsel),
+      .ext_px_done  (pp_ext_px_done),
+      .fog_rd_idx   (fog_rd_idx),
+      .fog_rd_blend (fog_rd_blend),
+      .fog_rd_delta (fog_rd_delta),
       .req_valid  (c2_req_valid),
       .req_ready  (c2_req_ready),
       .req_we     (c2_req_we),

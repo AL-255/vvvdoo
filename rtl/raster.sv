@@ -538,6 +538,8 @@ module raster
                        tri_params.texmode, tri_params.tlod,
                        tri_params.color0, tri_params.color1,
                        tri_params.zacolor, tri_params.dest_base,
+                       tri_params.stipple, tri_params.chromakey,
+                       tri_params.fogcolor,
                        tri_params.aux_base, tri_params.aux_valid,
                        tri_params.rowpixels, tri_params.yorigin};
 
