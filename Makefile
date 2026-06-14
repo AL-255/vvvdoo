@@ -14,7 +14,7 @@ RTL_SRCS := $(RTL_PKG) $(filter-out $(RTL_PKG),$(wildcard rtl/*.sv))
 RTL_CFG  := $(wildcard rtl/*.vlt)
 RTL_TOP  := voodoo_top
 
-.PHONY: all gold traces lint sim test-m1 test-m2 test-m3 test-m4 test unit clean cosim cosim-run
+.PHONY: all gold traces lint sim test-m1 test-m2 test-m3 test-m4 test unit clean cosim cosim-run cosim-lib
 
 all: gold traces lint sim
 
@@ -78,6 +78,30 @@ cosim: $(RTL_SRCS) $(RTL_CFG) cosim/cosim_replay.cpp
 
 cosim-run: cosim traces
 	$(BUILD)/cosim_replay tb/traces/m3_selftest_full.vvt $(BUILD)/cosim_m3
+
+# ---------------- LIVE QEMU RTL-C co-sim backend (static lib) ----------------
+# Verilates the RTL (no testbench), compiles the generated sources + Verilator
+# runtime + the VoodooRendererOps bridge, and archives a single static lib the
+# QEMU device links against.  VOODOO_INC is the source dir holding
+# voodoo_render.h (the ops boundary the bridge implements).
+VRTL_OBJDIR := $(BUILD)/vrtl_obj
+VRTL_LIB    := $(BUILD)/libvoodoortl.a
+VOODOO_INC  := $(abspath vvvdoo-refs/06-qemu-voodoo/src)
+VERILATOR_ROOT ?= $(shell $(VERILATOR) --getenv VERILATOR_ROOT)
+
+cosim-lib: $(VRTL_LIB)
+
+$(VRTL_LIB): $(RTL_SRCS) $(RTL_CFG) cosim/voodoo_rtl.cpp | $(BUILD)
+	rm -rf $(VRTL_OBJDIR)
+	$(VERILATOR) --cc -O3 -j 0 --top-module $(RTL_TOP) \
+	    -CFLAGS "-std=c++17 -O2 -fPIC -I$(VOODOO_INC)" \
+	    -Mdir $(VRTL_OBJDIR) \
+	    $(RTL_CFG) $(RTL_SRCS) $(abspath cosim/voodoo_rtl.cpp)
+	$(MAKE) -C $(VRTL_OBJDIR) -f V$(RTL_TOP).mk
+	@# collect every compiled object (generated RTL + verilated runtime + bridge)
+	ar rcs $(VRTL_LIB) $(VRTL_OBJDIR)/*.o
+	@echo "cosim-lib: built $(VRTL_LIB)"
+	@echo "cosim-lib: Verilator include dir = $(VERILATOR_ROOT)/include"
 
 # ---------------- unit tests ----------------
 UNIT_SRCS := $(wildcard tb/unit/*.cpp)
