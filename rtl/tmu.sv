@@ -54,6 +54,13 @@ module tmu
     return b ? 8'hff : 8'h00;
   endfunction
 
+`ifndef VOODOO_INT
+  // ---- FLOAT path (INT=0, gold-exact) ---------------------------------------
+  // log2tab + fast_log2f are the MAME-derived FLOAT baseline (s_log2_table bit
+  // pattern; behavioral `real`). Under VOODOO_INT the integer log2 lives in the
+  // shared voodoo_pkg::vd_log2_int (CLZ + vd_log2_mant LUT, PLAN §3.0/§3.2-A);
+  // callers switch which they invoke (S_LODBASE / S_DIV below). No `else body
+  // is needed here.
   // s_log2_table (MAME) — 7-bit mantissa index -> 8-bit frac
   function automatic logic [7:0] log2tab(input logic [6:0] m);
     logic [7:0] t [128];
@@ -102,6 +109,7 @@ module tmu
     expv = 24'($signed({20'd0, ival[18:7]}) - 32'sd1023 - 32'(fracbits));
     return $signed({expv, 8'd0} | {24'd0, log2tab(ival[6:0])});
   endfunction
+`endif // !VOODOO_INT  (FLOAT log2 path)
 
   // ================================================================
   //  latched triangle params
@@ -448,6 +456,8 @@ module tmu
           end
 
           S_LODBASE: begin
+`ifndef VOODOO_INT
+            // ---- FLOAT path (INT=0, gold-exact) ----
             // compute_lodbase (gold): texdx = (double)dsdx^2 + (double)dtdx^2,
             // texdy similarly; return fast_log2(max(texdx,texdy), 64) / 2.
             // Same operand order/grouping as gold for bit-exact float match.
@@ -463,6 +473,24 @@ module tmu
             l2 = fast_log2f(maxval, 64);
             lodbase_q <= l2 / 32'sd2;   // C int /2 truncates toward zero
             state_q <= S_RDY;
+`else
+            // ---- INTEGER path (VOODOO_INT, SPEC §6.1 / PLAN §3.2-B) ----
+            // Exact 128-bit sum-of-squares of the s32 14.18 S/T gradients
+            // (widen to s64 before squaring; product fits 128b), take the max,
+            // then integer log2 (fracbits=64) >>> 1 = /2 of the sqrt. The /2 is
+            // an arithmetic shift; log2(max) >= 0 here so >>> 1 == toward zero.
+            logic signed [63:0] gx0, gy0, gx1, gy1;
+            logic [127:0]       texdx, texdy, maxv;
+            gx0 = 64'($signed(tp_q.ds0dx)); gy0 = 64'($signed(tp_q.dt0dx));
+            gx1 = 64'($signed(tp_q.ds0dy)); gy1 = 64'($signed(tp_q.dt0dy));
+            texdx = 128'($signed(gx0) * $signed(gx0))
+                  + 128'($signed(gy0) * $signed(gy0));   // exact, ~128b
+            texdy = 128'($signed(gx1) * $signed(gx1))
+                  + 128'($signed(gy1) * $signed(gy1));
+            maxv  = (texdx > texdy) ? texdx : texdy;
+            lodbase_q <= vd_log2_int(maxv, 64) >>> 1;     // /2 toward zero (log2>=0)
+            state_q   <= S_RDY;
+`endif
           end
 
           S_RDY: begin
@@ -475,6 +503,8 @@ module tmu
           end
 
           S_DIV: begin
+`ifndef VOODOO_INT
+            // ---- FLOAT path (INT=0, gold-exact) ----
             // FLOAT perspective/affine, bit-exact mirror of gold fetch_texel.
             // iters/itert/iterw = (double)(int64_t)iterator; iterw==0 -> 1.0
             // (substituted at the gold call site, so clampnegw sees it too).
@@ -496,6 +526,35 @@ module tmu
             end
             negw_q  <= (iterw < 0.0);
             state_q <= S_LODCALC;
+`else
+            // ---- INTEGER path (VOODOO_INT, SPEC §5.2 / §6.1 / PLAN §3.2-C) ----
+            // iters/itert/iterw = (int64) iterators; iterw==0 -> 1 (same div-by-
+            // zero guard as the float path, substituted before BOTH the
+            // reciprocal and the log2 so clampnegw/lod see the guarded value).
+            logic signed [63:0] iters, itert, iterw;
+            iters = $signed(s0_q); itert = $signed(t0_q); iterw = $signed(w0_q);
+            if (iterw == 64'sd0) iterw = 64'sd1;     // div-by-zero guard
+            if (tp_q.texmode[0]) begin               // perspective
+              // S = (S/W)/(1/W): direct 64-bit divide, <<8 to land 8 fraction
+              // bits, signed `/` truncates toward zero == float $rtoi(iters*256/
+              // iterw). Replaces a fixed-R_SCALE reciprocal LUT whose s32 output
+              // lost precision for large iterw (recip collapsed to ~9 bits ->
+              // ~0.24% coord error -> texel swim on near/perspective walls, m5).
+              coord_s_q   <= 32'(($signed(iters) <<< 8) / iterw);
+              coord_t_q   <= 32'(($signed(itert) <<< 8) / iterw);
+              // lod_persp = -log2(|1/W|, 32 frac); negative 1/W -> 0 (matches
+              // gold fast_log2's value<0 -> 0). Feed the guarded magnitude as
+              // unsigned 128b; negate the result (the "- fast_log2(iterw,32)").
+              lod_persp_q <= iterw[63] ? 32'sd0
+                                       : -vd_log2_int({64'd0, $unsigned(iterw)}, 32);
+            end else begin                           // affine: /2^24 truncate toward zero
+              coord_s_q   <= 32'(vd_asr_trunc64(iters, 24));
+              coord_t_q   <= 32'(vd_asr_trunc64(itert, 24));
+              lod_persp_q <= 32'sd0;
+            end
+            negw_q  <= (iterw < 64'sd0);
+            state_q <= S_LODCALC;
+`endif
           end
 
           S_LODCALC: begin

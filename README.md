@@ -139,3 +139,5 @@ PLAN.md                           — full implementation plan & milestones
 See [`LICENSE`](LICENSE). The `vvvdoo-refs` submodule holds the QEMU device and
 reference material (some copyrighted); the SST-1 hardware behavior is modeled from
 public documentation and the 86Box/MAME open-source implementations.
+[`REFERENCES.md`](REFERENCES.md) lists every spec, patent, document, and tool used
+to build and verify the simulator.

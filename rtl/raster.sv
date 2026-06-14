@@ -19,6 +19,18 @@
 // behavioral model, while the per-pixel INTEGER iterator accumulators (rowp/
 // pixp, mod 2^32 / 2^64) are unchanged and synthesizable.
 //
+// VOODOO_INT path (`make INT=1`, +define+VOODOO_INT): each `real` coverage
+// region above is wrapped `ifndef VOODOO_INT (float, the default/pixel-exact
+// baseline) / `else (integer) / `endif. The `else body implements the doc-true
+// SST-1 integer coverage (docs/INT-BACKEND-SPEC.md §4.3): S11.4 verts widened
+// to S27.4, edge slopes as S27.4 per-+1-row DDA, per-scanline span via the
+// shared vd_edge_x()/vd_ceil_s11_4() helpers (voodoo_pkg) under the top-left
+// rule (startX=ceil(Xleft) left-in; fill [startX, ceil(Xright)-1] right-out;
+// rows [ceil(yTop/16), ceil(yBottom/16)) top-in/bottom-out), clipped to
+// [cl,cr)/[ct,cb). The integer iterator DDA (mul_p/rowp/pixp) and the outputs
+// first_c/last_c/empty_c are UNCHANGED — module interface identical. INT=1 is
+// judged by RMSE vs INT=0, never by `make test` (the float path is the gate).
+//
 // The iterator ORIGIN is now the ORIGINAL vertex A, arithmetic-floored:
 //   ox = $signed(ax) >>> 4, oy = $signed(ay) >>> 4
 // matching gold's ox=asr32(ax,4), oy=asr32(ay,4). The per-pixel value
@@ -64,6 +76,7 @@ module raster
     output logic signed [63:0] px_w0
 );
 
+`ifndef VOODOO_INT
   // round_coordinate(v): MAME poly.h round-to-nearest, ties (.5) round DOWN.
   // f=$floor(v); $rtoi(f) is exact for integer-valued reals.
   function automatic int round_coordinate(input real v);
@@ -71,6 +84,11 @@ module raster
     f = $floor(v);
     return $rtoi(f) + (((v - f) > 0.5) ? 1 : 0);
   endfunction
+`else
+  // No round_coordinate in the INT path: the §4.3 top-left rule uses
+  // vd_ceil_s11_4 (left/top edges in via ceil) + the row-inclusion test,
+  // not round-to-nearest. See the per-scanline span block and R_SETUP below.
+`endif
 
   // ----------------------------------------------------------------
   // FSM
@@ -104,12 +122,23 @@ module raster
   logic signed [63:0] ch_dy    [9];
 
   // ----------------------------------------------------------------
-  // FLOAT coverage scalars (sim-only `real`). Latched at R_SETUP from the
-  // sorted float verts; used combinationally per scanline.
+  // coverage scalars. Latched at R_SETUP from the sorted verts; used
+  // combinationally per scanline.
   // ----------------------------------------------------------------
+`ifndef VOODOO_INT
+  // FLOAT coverage scalars (sim-only `real`).
   // v1,v2 needed per-scanline; v3 only feeds the (precomputed) slopes.
   real v1x_q, v1y_q, v2x_q, v2y_q;
   real dxdy13_q, dxdy12_q, dxdy23_q;
+`else
+  // INTEGER coverage scalars (SPEC §4.3). The three S11.4 verts are sorted by
+  // Y, then WIDENED to S27.4. Edge slopes are the dX/dY ratio carried at
+  // 2^VD_SLOPE_FRAC (s64), computed from the FULL S11.4 dY (not truncated to
+  // rows), so the per-scanline edge X tracks the float double slope with no
+  // long-edge drift. v1,v2 per-scanline; v3 only feeds the precomputed slopes.
+  logic signed [31:0] v1x_q, v1y_q, v2x_q, v2y_q;   // S27.4 (4 frac bits)
+  logic signed [63:0] dxdy13_q, dxdy12_q, dxdy23_q; // dX/dY at 2^VD_SLOPE_FRAC
+`endif
 
   // ----------------------------------------------------------------
   // setup / per-row scalars (32-bit signed working registers)
@@ -146,12 +175,16 @@ module raster
   assign mul_p = mul_a * mul_b;   // SV: 64-bit operands -> mod-2^64 product
 
   // ----------------------------------------------------------------
-  // per-scanline float span (combinational, gold raster_triangle loop body)
+  // per-scanline span (combinational). first_c/last_c/empty_c are the
+  // shared 32-bit/1-bit outputs the FSM consumes at R_SPAN (interface
+  // identical across both datapaths).
   // ----------------------------------------------------------------
-  real fully_c, startx_c, stopx_c;
-  int  istartx_c, istopx_c, ilo_c, ihi_c;
   logic signed [31:0] first_c, last_c;
   logic               empty_c;
+`ifndef VOODOO_INT
+  // FLOAT span (gold raster_triangle loop body).
+  real fully_c, startx_c, stopx_c;
+  int  istartx_c, istopx_c, ilo_c, ihi_c;
   always_comb begin
     fully_c  = real'(y_q) + 0.5;
     startx_c = v1x_q + (fully_c - v1y_q) * dxdy13_q;
@@ -169,6 +202,32 @@ module raster
     last_c  = $signed(ihi_c) - 32'sd1;     // inclusive walk forward
     empty_c = ($signed(ilo_c) >= $signed(ihi_c));
   end
+`else
+  // INTEGER span — SPEC §4.3 top-left rule. y_q is the integer scanline;
+  // verts/slopes are S27.4. Edge X at row y_q via the shared S27.4 DDA
+  // helper vd_edge_x(); startX = ceil(Xleft) (left-in), last filled column
+  // = ceil(Xright)-1 (right-out). Winding handled by the min/max on
+  // xL/xR (mirrors the float lo/hi swap), so sign_q stays unused.
+  always_comb begin
+    logic signed [31:0] xL_s4, xR_s4;     // S27.4 left/right edge X at row y_q
+    logic signed [31:0] startx, stopx;    // integer pixel columns
+    // major edge AC at row y_q (S11.4 domain DDA)
+    xL_s4 = vd_edge_x(v1x_q, v1y_q, dxdy13_q, y_q);
+    // minor edge: AB while above v2 (upper), BC at/below v2 (lower)
+    xR_s4 = (($signed(y_q) <<< 4) < v2y_q)
+            ? vd_edge_x(v1x_q, v1y_q, dxdy12_q, y_q)
+            : vd_edge_x(v2x_q, v2y_q, dxdy23_q, y_q);
+    // left-in: ceil ; right-out: ceil-1 (half-open [startX, ceil(Xright)-1])
+    startx = vd_round_s11_4((xL_s4 <= xR_s4) ? xL_s4 : xR_s4);
+    stopx  = vd_round_s11_4((xL_s4 <= xR_s4) ? xR_s4 : xL_s4) - 32'sd1;
+    // clip to [cl, cr); right EXCLUSIVE
+    if ($signed(startx) < cl32)        startx = cl32;
+    if ($signed(stopx)  > (cr32 - 32'sd1)) stopx = cr32 - 32'sd1;
+    first_c = startx;
+    last_c  = stopx;
+    empty_c = ($signed(startx) > $signed(stopx));
+  end
+`endif
 
   // ----------------------------------------------------------------
   // iterator accumulators
@@ -198,8 +257,13 @@ module raster
       ax_q <= '0; ay_q <= '0; bx_q <= '0; by_q <= '0; cx_q <= '0; cy_q <= '0;
       sign_q       <= 1'b0;
       cl_q <= '0; cr_q <= '0; ct_q <= '0; cb_q <= '0;
+`ifndef VOODOO_INT
       v1x_q <= 0.0; v1y_q <= 0.0; v2x_q <= 0.0; v2y_q <= 0.0;
       dxdy13_q <= 0.0; dxdy12_q <= 0.0; dxdy23_q <= 0.0;
+`else
+      v1x_q <= '0; v1y_q <= '0; v2x_q <= '0; v2y_q <= '0;
+      dxdy13_q <= '0; dxdy12_q <= '0; dxdy23_q <= '0;
+`endif
       ox_q <= '0; yend_q <= '0;
       y_q <= '0; dy0_q <= '0; dx0_q <= '0;
       first_q <= '0; last_q <= '0; x_q <= '0;
@@ -273,9 +337,10 @@ module raster
         end
 
         // ------------------------------------------------------------
-        // R_SETUP: build float verts, stable-sort by vy ascending, compute
-        // edge slopes, iy1/iy3, origin floor; seed the scanline loop.
+        // R_SETUP: build verts, stable-sort by vy ascending, compute
+        // edge slopes, first/last row, origin floor; seed the scanline loop.
         R_SETUP: begin
+`ifndef VOODOO_INT
           // float verts from 12.4 coords (/16) — same expressions as gold
           real ax_f, ay_f, bx_f, by_f, cx_f, cy_f;
           real s1x, s1y, s2x, s2y, s3x, s3y;   // sorted v1,v2,v3
@@ -318,9 +383,6 @@ module raster
           dxdy12_q <= d12;
           dxdy23_q <= d23;
 
-          // iterator origin = ORIGINAL vertex A, arithmetic floor (gold asr32)
-          ox_q <= 32'($signed(ax_q)) >>> 4;
-
           // iy1=round(v1y), iy3=round(v3y), clip y to [ct, cb)
           iy1 = round_coordinate(s1y);
           iy3 = round_coordinate(s3y);
@@ -337,6 +399,66 @@ module raster
             dy0_q   <= iy1 - (32'($signed(ay_q)) >>> 4);
             state_q <= R_ROWINIT;
           end
+`else
+          // INTEGER vert sort + S27.4 slopes (SPEC §4.3). Sort the three
+          // S11.4 verts by Y with STRICT < (matches the stable-sort tie
+          // behavior of the float path), widen to S27.4, compute per-+1-row
+          // slope DDA increments; first/last row by the top-left ceil rule.
+          logic signed [31:0] s1x, s1y, s2x, s2y, s3x, s3y;  // sorted, S27.4
+          logic signed [31:0] tx, ty;                        // swap temporaries
+          logic signed [31:0] iy1, iy3;                      // first/last(excl) row
+          // widen S11.4 verts to S27.4 (exact: /16 lossless in this domain)
+          s1x = 32'($signed(ax_q)); s1y = 32'($signed(ay_q));
+          s2x = 32'($signed(bx_q)); s2y = 32'($signed(by_q));
+          s3x = 32'($signed(cx_q)); s3y = 32'($signed(cy_q));
+          // stable sort of 3 by y ascending (same 3 compares as the float path)
+          if (s2y < s1y) begin
+            tx = s1x; s1x = s2x; s2x = tx;
+            ty = s1y; s1y = s2y; s2y = ty;
+          end
+          if (s3y < s2y) begin
+            tx = s2x; s2x = s3x; s3x = tx;
+            ty = s2y; s2y = s3y; s3y = ty;
+          end
+          if (s2y < s1y) begin
+            tx = s1x; s1x = s2x; s2x = tx;
+            ty = s1y; s1y = s2y; s2y = ty;
+          end
+          v1x_q <= s1x; v1y_q <= s1y;
+          v2x_q <= s2x; v2y_q <= s2y;
+
+          // slope = dX/dY at 2^VD_SLOPE_FRAC from the FULL S11.4 dY (the .4
+          // scales cancel) — near-exact, so edge X tracks the float double
+          // slope with no long-edge drift. 0 for a horizontal edge.
+          dxdy13_q <= (s3y != s1y)
+            ? ((64'($signed(s3x - s1x)) <<< VD_SLOPE_FRAC) / 64'($signed(s3y - s1y))) : 64'sd0;
+          dxdy12_q <= (s2y != s1y)
+            ? ((64'($signed(s2x - s1x)) <<< VD_SLOPE_FRAC) / 64'($signed(s2y - s1y))) : 64'sd0;
+          dxdy23_q <= (s3y != s2y)
+            ? ((64'($signed(s3x - s2x)) <<< VD_SLOPE_FRAC) / 64'($signed(s3y - s2y))) : 64'sd0;
+
+          // first/end row = round_coordinate(yTop/yBottom) (round-nearest,
+          // ties down) to match the float Y range; rows [iy1, iy3). Clip to [ct,cb).
+          iy1 = vd_round_s11_4(s1y);
+          iy3 = vd_round_s11_4(s3y);
+          if ($signed(iy1) < ct32) iy1 = ct32;
+          if ($signed(iy3) > cb32) iy3 = cb32;
+
+          y_q    <= iy1;
+          yend_q <= iy3;
+          ch_q   <= 4'd0;
+          if ($signed(iy1) >= $signed(iy3))
+            state_q <= R_FLUSH;          // no candidate rows at all
+          else begin
+            // seed dy0 = curscan - oy for the first scanline's R_ROWINIT
+            dy0_q   <= iy1 - (32'($signed(ay_q)) >>> 4);
+            state_q <= R_ROWINIT;
+          end
+`endif
+          // iterator origin = ORIGINAL vertex A, arithmetic floor (gold asr32);
+          // already integer and identical for both datapaths (seeds the exact
+          // integer iterators). Outside the `ifdef so it is shared.
+          ox_q <= 32'($signed(ax_q)) >>> 4;
         end
 
         R_ROWINIT: begin

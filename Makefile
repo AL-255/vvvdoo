@@ -14,7 +14,19 @@ RTL_SRCS := $(RTL_PKG) $(filter-out $(RTL_PKG),$(wildcard rtl/*.sv))
 RTL_CFG  := $(wildcard rtl/*.vlt)
 RTL_TOP  := voodoo_top
 
-.PHONY: all gold traces lint sim test-m1 test-m2 test-m3 test-m4 test-m5 test unit clean cosim cosim-run cosim-lib
+# INT=1 builds the fixed-point (VOODOO_INT) datapath: appends +define+VOODOO_INT to
+# every verilator invocation (lint/sim/cosim/cosim-lib). INT=0 (default) is the float
+# datapath that is pixel-exact vs the gold model — the `make test` contract.
+# Verilator obj dirs and output binaries are SUFFIXED with $(INT) so the float and int
+# artifacts coexist (the RMSE harness needs both at once) and a stale INT toggle can
+# never silently reuse the wrong generated C++.
+INT   ?= 0
+VDEFS :=
+ifeq ($(INT),1)
+VDEFS += +define+VOODOO_INT
+endif
+
+.PHONY: all gold traces lint sim test-m1 test-m2 test-m3 test-m4 test-m5 test unit clean cosim cosim-run cosim-lib rmse
 
 all: gold traces lint sim
 
@@ -34,6 +46,11 @@ $(BUILD)/vgold_replay: tools/vgold_replay.c $(BUILD)/libvgold.a
 $(BUILD)/tracegen: tools/tracegen.c $(BUILD)/libvgold.a
 	$(CC) $(CFLAGS) -Imodel $< $(BUILD)/libvgold.a -lm -o $@
 
+# RMSE/PSNR metric tool — dependency-free C11, links -lm only (NOT libvgold; it is a pure
+# PPM comparator used for int-vs-float, int-vs-gold, and rtl-vs-gold image diffs).
+$(BUILD)/ppm_rmse: tools/ppm_rmse.c | $(BUILD)
+	$(CC) $(CFLAGS) $< -lm -o $@
+
 gold: $(BUILD)/libvgold.a $(BUILD)/vgold_replay $(BUILD)/tracegen
 
 traces: gold
@@ -42,7 +59,7 @@ traces: gold
 
 # ---------------- RTL ----------------
 lint: $(RTL_SRCS) $(RTL_CFG)
-	$(VERILATOR) --lint-only -Wall --top-module $(RTL_TOP) $(RTL_CFG) $(RTL_SRCS)
+	$(VERILATOR) --lint-only -Wall --top-module $(RTL_TOP) $(VDEFS) $(RTL_CFG) $(RTL_SRCS)
 
 VSIM_FLAGS := --cc --exe --build -O3 -j 0 --assert --top-module $(RTL_TOP) \
               -CFLAGS "-std=c++17 -O2 -I$(abspath model)" \
@@ -52,35 +69,45 @@ VSIM_FLAGS += --trace-fst
 endif
 
 sim: $(RTL_SRCS) $(RTL_CFG) tb/frame/tb_main.cpp $(BUILD)/libvgold.a
-	$(VERILATOR) $(VSIM_FLAGS) -Mdir $(BUILD)/vsim_obj -o vsim \
-	    $(RTL_CFG) $(RTL_SRCS) $(abspath tb/frame/tb_main.cpp)
-	cp $(BUILD)/vsim_obj/vsim $(BUILD)/vsim
+	$(VERILATOR) $(VSIM_FLAGS) -Mdir $(BUILD)/vsim_obj$(INT) -o vsim$(INT) \
+	    $(VDEFS) $(RTL_CFG) $(RTL_SRCS) $(abspath tb/frame/tb_main.cpp)
+	cp $(BUILD)/vsim_obj$(INT)/vsim$(INT) $(BUILD)/vsim$(INT)
 
-test-m1: sim traces
+# `make test` is an INT=0-only contract (the gold model is float; INT=1 is judged by RMSE,
+# never by test). The test-mN recipes run the unsuffixed $(BUILD)/vsim: build it via the
+# INT=0 sim and alias vsim0 -> vsim so the test command lines stay unchanged.
+.PHONY: vsim
+vsim:
+	$(MAKE) sim INT=0
+	cp $(BUILD)/vsim0 $(BUILD)/vsim
+
+test-m1: vsim traces
 	$(BUILD)/vsim tb/traces/m1_fill_lfb.vvt
 
-test-m2: sim traces
+test-m2: vsim traces
 	$(BUILD)/vsim tb/traces/m2_tri_gouraud.vvt
 
-test-m3: sim traces
+test-m3: vsim traces
 	$(BUILD)/vsim tb/traces/m3_selftest_full.vvt
 
-test-m4: sim traces
+test-m4: vsim traces
 	$(BUILD)/vsim tb/traces/m4_pipeline.vvt
 
-test-m5: sim traces
+test-m5: vsim traces
 	$(BUILD)/vsim tb/traces/m5_texfmt.vvt
 
 # ---------------- RTL-C co-simulation harness ----------------
 COSIM_FLAGS := --cc --exe --build -O3 -j 0 --top-module $(RTL_TOP) \
                -CFLAGS "-std=c++17 -O2"
 cosim: $(RTL_SRCS) $(RTL_CFG) cosim/cosim_replay.cpp
-	$(VERILATOR) $(COSIM_FLAGS) -Mdir $(BUILD)/cosim_obj -o cosim_replay \
-	    $(RTL_CFG) $(RTL_SRCS) $(abspath cosim/cosim_replay.cpp)
-	cp $(BUILD)/cosim_obj/cosim_replay $(BUILD)/cosim_replay
+	$(VERILATOR) $(COSIM_FLAGS) -Mdir $(BUILD)/cosim_obj$(INT) -o cosim_replay$(INT) \
+	    $(VDEFS) $(RTL_CFG) $(RTL_SRCS) $(abspath cosim/cosim_replay.cpp)
+	cp $(BUILD)/cosim_obj$(INT)/cosim_replay$(INT) $(BUILD)/cosim_replay$(INT)
 
-cosim-run: cosim traces
-	$(BUILD)/cosim_replay tb/traces/m3_selftest_full.vvt $(BUILD)/cosim_m3
+# cosim-run is the float (INT=0) smoke test; the RMSE harness drives both replay0/replay1.
+cosim-run: traces
+	$(MAKE) cosim INT=0
+	$(BUILD)/cosim_replay0 tb/traces/m3_selftest_full.vvt $(BUILD)/cosim_m3
 
 # ---------------- LIVE QEMU RTL-C co-sim backend (static lib) ----------------
 # Verilates the RTL (no testbench), compiles the generated sources + Verilator
@@ -99,12 +126,28 @@ $(VRTL_LIB): $(RTL_SRCS) $(RTL_CFG) cosim/voodoo_rtl.cpp | $(BUILD)
 	$(VERILATOR) --cc -O3 -j 0 --top-module $(RTL_TOP) \
 	    -CFLAGS "-std=c++17 -O2 -fPIC -I$(VOODOO_INC)" \
 	    -Mdir $(VRTL_OBJDIR) \
-	    $(RTL_CFG) $(RTL_SRCS) $(abspath cosim/voodoo_rtl.cpp)
+	    $(VDEFS) $(RTL_CFG) $(RTL_SRCS) $(abspath cosim/voodoo_rtl.cpp)
 	$(MAKE) -C $(VRTL_OBJDIR) -f V$(RTL_TOP).mk
 	@# collect every compiled object (generated RTL + verilated runtime + bridge)
 	ar rcs $(VRTL_LIB) $(VRTL_OBJDIR)/*.o
 	@echo "cosim-lib: built $(VRTL_LIB)"
 	@echo "cosim-lib: Verilator include dir = $(VERILATOR_ROOT)/include"
+
+# ---------------- INT-vs-FLOAT RMSE harness ----------------
+# Builds both datapaths (float=cosim_replay0, int=cosim_replay1; suffixed obj dirs so no
+# clean is needed between toggles), replays m1..m5 through each, and reports per-frame
+# RMSE/PSNR. m1 ~= 0 (fills), m2 small (Gouraud coverage), m5 largest (TMU divide/log2).
+rmse: $(BUILD)/ppm_rmse traces
+	@$(MAKE) cosim INT=0
+	@$(MAKE) cosim INT=1
+	@set -e; for t in m1_fill_lfb m2_tri_gouraud m3_selftest_full m4_pipeline m5_texfmt; do \
+	  echo "== $$t"; \
+	  $(BUILD)/cosim_replay0 tb/traces/$$t.vvt $(BUILD)/float_$$t >/dev/null; \
+	  $(BUILD)/cosim_replay1 tb/traces/$$t.vvt $(BUILD)/int_$$t   >/dev/null; \
+	  for fp in $(BUILD)/float_$${t}_*.ppm; do \
+	    ip=$${fp/float_/int_}; [ -f "$$ip" ] && $(BUILD)/ppm_rmse "$$fp" "$$ip"; \
+	  done; \
+	done
 
 # ---------------- unit tests ----------------
 UNIT_SRCS := $(wildcard tb/unit/*.cpp)
