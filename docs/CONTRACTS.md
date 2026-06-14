@@ -214,7 +214,13 @@ module voodoo_top
     input  logic [31:0] init_enable,     // PCI config 0x40 (op=2 in traces)
 
     output logic        busy,            // FIFO non-empty or any engine active
-    output logic [1:0]  dbg_frontbuf
+    output logic [1:0]  dbg_frontbuf,
+    // Scanout descriptor (added M5): displayed buffer base word offset in
+    // fb_ram + geometry, for host/co-sim framebuffer readback.
+    output logic [FB_AW-1:0] scan_front_base,
+    output logic [10:0]      scan_rowpixels,
+    output logic [9:0]       scan_width,
+    output logic [9:0]       scan_height
 );
 ```
 

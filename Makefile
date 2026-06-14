@@ -14,7 +14,7 @@ RTL_SRCS := $(RTL_PKG) $(filter-out $(RTL_PKG),$(wildcard rtl/*.sv))
 RTL_CFG  := $(wildcard rtl/*.vlt)
 RTL_TOP  := voodoo_top
 
-.PHONY: all gold traces lint sim test-m1 test-m2 test unit clean
+.PHONY: all gold traces lint sim test-m1 test-m2 test-m3 test unit clean cosim cosim-run
 
 all: gold traces lint sim
 
@@ -64,6 +64,17 @@ test-m2: sim traces
 
 test-m3: sim traces
 	$(BUILD)/vsim tb/traces/m3_selftest_full.vvt
+
+# ---------------- RTL-C co-simulation harness ----------------
+COSIM_FLAGS := --cc --exe --build -O3 -j 0 --top-module $(RTL_TOP) \
+               -CFLAGS "-std=c++17 -O2"
+cosim: $(RTL_SRCS) $(RTL_CFG) cosim/cosim_replay.cpp
+	$(VERILATOR) $(COSIM_FLAGS) -Mdir $(BUILD)/cosim_obj -o cosim_replay \
+	    $(RTL_CFG) $(RTL_SRCS) $(abspath cosim/cosim_replay.cpp)
+	cp $(BUILD)/cosim_obj/cosim_replay $(BUILD)/cosim_replay
+
+cosim-run: cosim traces
+	$(BUILD)/cosim_replay tb/traces/m3_selftest_full.vvt $(BUILD)/cosim_m3
 
 # ---------------- unit tests ----------------
 UNIT_SRCS := $(wildcard tb/unit/*.cpp)

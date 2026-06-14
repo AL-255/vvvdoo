@@ -23,7 +23,14 @@ module voodoo_top
     input  logic [31:0] init_enable,     // PCI config 0x40 (op=2 in traces)
 
     output logic        busy,            // FIFO non-empty or any engine active
-    output logic [1:0]  dbg_frontbuf
+    output logic [1:0]  dbg_frontbuf,
+
+    // Scanout descriptor (chip-pin level; for host/co-sim display readback).
+    // scan_front_base = word offset of the displayed buffer in fb_ram.
+    output logic [FB_AW-1:0] scan_front_base,
+    output logic [10:0]      scan_rowpixels,
+    output logic [9:0]       scan_width,
+    output logic [9:0]       scan_height
 );
 
   // ----------------------------------------------------------------
@@ -130,6 +137,12 @@ module voodoo_top
   // ----------------------------------------------------------------
   assign busy         = fifo_nonempty | dispatch_busy;
   assign dbg_frontbuf = r_frontbuf;
+
+  // scanout descriptor: displayed buffer = rgboffs_w[frontbuf]
+  assign scan_front_base = r_rgboffs_w[r_frontbuf];
+  assign scan_rowpixels  = r_rowpixels;
+  assign scan_width      = r_width;
+  assign scan_height     = r_height;
 
   // ----------------------------------------------------------------
   // host interface
