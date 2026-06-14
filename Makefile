@@ -62,6 +62,9 @@ test-m1: sim traces
 test-m2: sim traces
 	$(BUILD)/vsim tb/traces/m2_tri_gouraud.vvt
 
+test-m3: sim traces
+	$(BUILD)/vsim tb/traces/m3_selftest_full.vvt
+
 # ---------------- unit tests ----------------
 UNIT_SRCS := $(wildcard tb/unit/*.cpp)
 UNIT_BINS := $(patsubst tb/unit/%.cpp,$(BUILD)/unit_%,$(UNIT_SRCS))
@@ -72,7 +75,7 @@ $(BUILD)/unit_%: tb/unit/%.cpp $(BUILD)/libvgold.a
 unit: $(UNIT_BINS)
 	@set -e; for t in $(UNIT_BINS); do echo "== $$t"; $$t; done
 
-test: unit test-m1 test-m2
+test: unit test-m1 test-m2 test-m3
 
 clean:
 	rm -rf $(BUILD)

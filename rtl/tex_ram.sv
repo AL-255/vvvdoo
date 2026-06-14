@@ -6,7 +6,11 @@ module tex_ram
     input  logic               clk,
     input  logic [1:0]         we,     // per-byte enables: [0]=bits 7:0, [1]=bits 15:8
     input  logic [TEX_AW-1:0]  addr,   // 16-bit word address
-    input  logic [15:0]        wdata
+    input  logic [15:0]        wdata,
+    // M3 TMU read port (1-cycle registered read; temporally disjoint from
+    // the write port, so no arbitration is required — CONTRACTS §11b)
+    input  logic [TEX_AW-1:0]  addr_r,
+    output logic [15:0]        rdata_r
 );
 
   localparam int unsigned DEPTH = 1 << TEX_AW;
@@ -18,6 +22,7 @@ module tex_ram
       mem[addr][7:0] <= wdata[7:0];
     if (we[1])
       mem[addr][15:8] <= wdata[15:8];
+    rdata_r <= mem[addr_r];
   end
 
 endmodule

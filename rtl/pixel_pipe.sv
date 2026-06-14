@@ -75,6 +75,19 @@ module pixel_pipe
     input  logic              rsp_valid,
     input  logic [15:0]       rsp_rdata,
 
+    // M3 TMU sample channel (§11b)
+    output logic        smp_valid,
+    input  logic        smp_ready,
+    output logic [63:0] smp_s0,
+    output logic [63:0] smp_t0,
+    output logic [63:0] smp_w0,
+    input  logic        tex_valid,
+    output logic        tex_ready,
+    input  logic [7:0]  tex_a,
+    input  logic [7:0]  tex_r,
+    input  logic [7:0]  tex_g,
+    input  logic [7:0]  tex_b,
+
     output logic        pixout_inc
 );
 
@@ -340,6 +353,8 @@ module pixel_pipe
     P_PREP,      // sy / addresses / OOB / wfloat / depthval / clamped iters
     P_ZREQ,      // issue depth read
     P_ZWAIT,     // wait stored depth, compare
+    P_TEXREQ,    // issue TMU sample (texturing only)
+    P_TEXWAIT,   // wait tex_valid
     P_COMBINE,   // color combine
     P_ATEST,     // alpha test + blend routing
     P_BREQ,      // issue dest read for blend
@@ -357,6 +372,12 @@ module pixel_pipe
   logic [9:0]         x_q, y_q;
   logic signed [31:0] r_q, g_q, b_q, a_q, z_q;
   logic signed [63:0] w_q;
+  logic signed [63:0] s0_q, t0_q, w0_q;        // M3 texture iterators
+  logic [31:0]        texel_q;                  // {a,r,g,b} from TMU (or white)
+
+  // texturing predicate (gold: CP_texenable(cp) && (tm != 0))
+  logic texturing;
+  assign texturing = tp_q.fbzcp[27] & (tp_q.texmode != 32'd0);
 
   // stage-1/2/3/4 results
   logic [1:0]         sy_lo_q;          // post-flip sy[1:0] (dither row)
@@ -462,6 +483,13 @@ module pixel_pipe
   assign px_ready = (state_q == P_IDLE);
   assign tri_done = (state_q == P_RETIRE) & last_q;
 
+  // TMU sample channel: request in P_TEXREQ, accept response in P_TEXWAIT
+  assign smp_valid = (state_q == P_TEXREQ);
+  assign smp_s0    = s0_q;
+  assign smp_t0    = t0_q;
+  assign smp_w0    = w0_q;
+  assign tex_ready = (state_q == P_TEXWAIT);
+
   // ----------------------------------------------------------------
   // main sequential process
   // ----------------------------------------------------------------
@@ -472,6 +500,7 @@ module pixel_pipe
       last_q      <= 1'b0;
       x_q <= '0; y_q <= '0;
       r_q <= '0; g_q <= '0; b_q <= '0; a_q <= '0; z_q <= '0; w_q <= '0;
+      s0_q <= '0; t0_q <= '0; w0_q <= '0; texel_q <= 32'hffffffff;
       sy_lo_q     <= '0;
       dest_ok_q   <= 1'b0;
       aux_ok_q    <= 1'b0;
@@ -505,6 +534,10 @@ module pixel_pipe
             a_q    <= px_a;
             z_q    <= px_z;
             w_q    <= px_w;
+            s0_q   <= px_s0;
+            t0_q   <= px_t0;
+            w0_q   <= px_w0;
+            texel_q <= 32'hffffffff;     // M2 constant white; TMU overwrites
             state_q <= P_PREP;
           end
         end
@@ -531,7 +564,7 @@ module pixel_pipe
           else if (tp_q.fbzmode[4] && tp_q.aux_valid && prep_aux_ok)
             state_q <= P_ZREQ;            // depth test (gold pixel_pipe)
           else
-            state_q <= P_COMBINE;         // test skipped: aux unusable/OOB
+            state_q <= texturing ? P_TEXREQ : P_COMBINE;
         end
 
         // ------------------------------------------------------------
@@ -542,18 +575,30 @@ module pixel_pipe
             // depth func fbzMode[7:5] vs stored aux word
             if (cmp_pass(tp_q.fbzmode[7:5],
                          {1'b0, depthsrc_q}, {1'b0, rsp_rdata}))
-              state_q <= P_COMBINE;
+              state_q <= texturing ? P_TEXREQ : P_COMBINE;
             else
               state_q <= P_RETIRE;        // z-fail discard
           end
         end
 
         // ------------------------------------------------------------
+        // M3: request a texel from the TMU and stall until it returns
+        P_TEXREQ: if (smp_ready) state_q <= P_TEXWAIT;
+
+        P_TEXWAIT: begin
+          if (tex_valid) begin
+            texel_q <= {tex_a, tex_r, tex_g, tex_b};
+            state_q <= P_COMBINE;
+          end
+        end
+
+        // ------------------------------------------------------------
         P_COMBINE: begin
-          // 5) color combine; texel = ARGB(255,255,255,255) in M2
+          // 5) color combine; texel = TMU output (M3) or white (M2 path)
           col_q <= combine_colorf(tp_q.fbzcp[25:0], tp_q.color0, tp_q.color1,
                                   ir_q, ig_q, ib_q, ia_q,
-                                  8'd255, 8'd255, 8'd255, 8'd255,
+                                  texel_q[23:16], texel_q[15:8],
+                                  texel_q[7:0], texel_q[31:24],
                                   czh_q, cw_q);
           // (M4: chroma key / alpha mask / stipple / fog slot in after this)
           state_q <= P_ATEST;
@@ -611,7 +656,7 @@ module pixel_pipe
   // M2 pipe (fbzMode/fbzColorPath/alphaMode bits outside the M2 feature set;
   // px_r/g/b/a only contribute their 12-bit clamp fields per MAME)
   logic unused_sink;
-  assign unused_sink = &{1'b0, px_s0, px_t0, px_w0,
+  assign unused_sink = &{1'b0,
                          tp_q.ax, tp_q.ay, tp_q.bx, tp_q.by, tp_q.cx, tp_q.cy,
                          tp_q.sign,
                          tp_q.startr, tp_q.startg, tp_q.startb, tp_q.starta,
@@ -622,7 +667,7 @@ module pixel_pipe
                          tp_q.s0, tp_q.ds0dx, tp_q.ds0dy,
                          tp_q.t0, tp_q.dt0dx, tp_q.dt0dy,
                          tp_q.w0, tp_q.dw0dx, tp_q.dw0dy,
-                         tp_q.fogmode, tp_q.texmode, tp_q.tlod,
+                         tp_q.fogmode, tp_q.tlod,
                          tp_q.fbzmode[31:21], tp_q.fbzmode[19],
                          tp_q.fbzmode[15:12], tp_q.fbzmode[2:0],
                          tp_q.fbzcp[31:29], tp_q.fbzcp[27:26],

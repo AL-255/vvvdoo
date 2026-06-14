@@ -425,6 +425,63 @@ C/C++: `-O2 -g -Wall -Wextra -Werror`. C11 for model/tools, C++17 for TB.
 6. The PPM writer: front buffer, width x height from gold layout, 565→888
    replicate-bits expansion identical to gold's `from565`.
 
+## 11b. M3 — TMU (texture mapping unit)
+
+The golden model `model/voodoo_gold.c` is now FULLY INTEGER in the texture path
+(no float/double) and is the FROZEN bit-exact spec. RTL must match it. Key gold
+functions to mirror: `tex_recompute`, `compute_lodbase`, `fast_log2_i64`,
+`fast_log2_u128`, `fetch_texel`, `texel_expand`, `lookup_texel`,
+`combine_generic`, and the per-pixel texturing block in the rasterizer
+(`texel = combine_generic(ctex, zero, raw, raw.a, 0)`).
+
+Arithmetic decisions (normative, already in gold):
+- Perspective: `s = trunc((S*256)/W)`, `t = trunc((T*256)/W)` via a real
+  (128-bit numerator) signed divide truncating toward zero; `W==0`→1.
+  `lod -= fast_log2_i64(W, 32)`.
+- Affine (no perspective): `s = trunc(S / 2^24)`, `t = trunc(T / 2^24)`.
+- `fast_log2_i64(v, f)`: v<0→0; v==0→`(-(1023+f))<<8`; else
+  `((p - f) << 8) | table[m7]` where `p = 63 - clz64(v)` and m7 = the 7 bits
+  just below the MSB (`(v>>(p-7))&127`, or `(v<<(7-p))&127` for p<7).
+- `compute_lodbase`: `fast_log2_u128(max(ds·ds+dt·dt over x, over y), 64) / 2`
+  using exact 128-bit sums of the signed 64-bit S/T gradients.
+- LOD select: `lod += lodbias; clamp[lodmin,lodmax]; ilod = lod>>8;
+  ilod += (~lodmask>>ilod)&1; cap 8`. Filter: point vs bilinear per the gold
+  predicate; bilinear keeps 4 fractional bits (`&0xf0`), weights `>>8`.
+- `lodoffset[0..8]` chain exactly as gold `tex_recompute` (raw footprint LOD
+  1-3, min-4-texel clamp LOD 4-8, `<<bppscale`, `& TEX_MASK`).
+- Texel address: bpt1 `(texbase + t + s) & TEX_MASK`; bpt2
+  `(texbase + 2*(t+s)) & TEX_MASK & ~1`. `t` is pre-multiplied by `smax+1`.
+- Texture-combine is part of the TMU: it returns the POST-`combine_generic`
+  texel (control = TM_tc_*/TM_tca_* fields), which pixel_pipe feeds into the
+  color-combine `texel` input.
+
+Interfaces (verbatim):
+- `tex_ram` GAINS a read port (write port unchanged):
+  `input logic [TEX_AW-1:0] addr_r; output logic [15:0] rdata_r;` with 1-cycle
+  registered read latency. tex_dl (write) and the TMU (read) are temporally
+  disjoint, so no arbitration is required.
+- New module `rtl/tmu.sv`. It latches tri_params at `tri_valid&&tri_ready`
+  (same launch as pixel_pipe), does per-triangle setup, and serves a per-pixel
+  sample request from pixel_pipe:
+  ```
+  input  logic        smp_valid;   output logic smp_ready;   // request
+  input  logic [63:0] smp_s0, smp_t0, smp_w0;
+  output logic        tex_valid;   input  logic tex_ready;   // response
+  output logic [7:0]  tex_a, tex_r, tex_g, tex_b;            // post-combine
+  output logic [TEX_AW-1:0] trd_addr; input logic [15:0] trd_data; // to tex_ram
+  ```
+  Multi-cycle (sequential divider, sequential 1–4 texel reads) is fine.
+- `pixel_pipe`: when `tri_params.fbzcp[27] && tri_params.texmode != 0`
+  (texturing), at the color-combine stage it issues `smp_*` with the pixel's
+  s0/t0/w0 and stalls until `tex_valid`, using the returned ARGB as the texel
+  input; otherwise the texel stays constant white (M2 behavior). The texturing
+  predicate and constant-white default must match gold exactly.
+- `voodoo_top` instantiates `tmu u_tmu`, wires it between pixel_pipe and
+  u_tex_ram's new read port, and routes tri launch to it.
+
+M3 done = `make lint` clean; `make test` (unit + test-m1 + test-m2 + test-m3)
+all PIXEL-EXACT. test-m1/m2 must NOT regress.
+
 ## 12. Definition of done (this turn)
 
 - `make lint` clean; `make gold traces unit` green.

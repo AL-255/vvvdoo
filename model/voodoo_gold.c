@@ -597,53 +597,89 @@ static argb_t lookup_texel(const vgold_t *g, uint32_t texbase, int s, int t)
     return texel_expand(g, raw);
 }
 
-/* fast_log2 of a double as 24.8 fixed point — M3: integerize */
-static int32_t fast_log2(double value, int fracbits)
+/* log2 mantissa table (MAME s_log2_table). 7-bit mantissa index -> 8-bit frac. */
+static const uint8_t s_log2_table[128] = {
+      0,   2,   5,   8,  11,  14,  16,  19,  22,  25,  27,  30,  33,  35,  38,  40,
+     43,  46,  48,  51,  53,  56,  58,  61,  63,  65,  68,  70,  73,  75,  77,  80,
+     82,  84,  87,  89,  91,  93,  96,  98, 100, 102, 104, 106, 109, 111, 113, 115,
+    117, 119, 121, 123, 125, 127, 129, 132, 134, 136, 138, 140, 141, 143, 145, 147,
+    149, 151, 153, 155, 157, 159, 161, 162, 164, 166, 168, 170, 172, 173, 175, 177,
+    179, 181, 182, 184, 186, 188, 189, 191, 193, 194, 196, 198, 200, 201, 203, 205,
+    206, 208, 209, 211, 213, 214, 216, 218, 219, 221, 222, 224, 225, 227, 229, 230,
+    232, 233, 235, 236, 238, 239, 241, 242, 244, 245, 247, 248, 250, 251, 253, 254
+};
+
+/* Integer fast_log2 (24.8 fixed). For an integer value reinterpreted as an
+ * IEEE-754 double, the exponent and top-7 mantissa bits are exactly the CLZ
+ * normalization of the integer, so this is BIT-EXACT to the old double-bit
+ * version (mame_voodoo_render.cpp:165) yet fully reproducible in RTL.
+ *  - negative input  -> 0          (matches the `value < 0` guard)
+ *  - zero input      -> (-(1023+fracbits)) << 8  (matches double 0.0 bits)
+ */
+static int32_t fast_log2_i64(int64_t v, int fracbits)
 {
-    static const uint8_t s_log2_table[128] = {
-          0,   2,   5,   8,  11,  14,  16,  19,  22,  25,  27,  30,  33,  35,  38,  40,
-         43,  46,  48,  51,  53,  56,  58,  61,  63,  65,  68,  70,  73,  75,  77,  80,
-         82,  84,  87,  89,  91,  93,  96,  98, 100, 102, 104, 106, 109, 111, 113, 115,
-        117, 119, 121, 123, 125, 127, 129, 132, 134, 136, 138, 140, 141, 143, 145, 147,
-        149, 151, 153, 155, 157, 159, 161, 162, 164, 166, 168, 170, 172, 173, 175, 177,
-        179, 181, 182, 184, 186, 188, 189, 191, 193, 194, 196, 198, 200, 201, 203, 205,
-        206, 208, 209, 211, 213, 214, 216, 218, 219, 221, 222, 224, 225, 227, 229, 230,
-        232, 233, 235, 236, 238, 239, 241, 242, 244, 245, 247, 248, 250, 251, 253, 254
-    };
-    if (value < 0)
+    if (v < 0)
         return 0;
-    union { double d; uint64_t i; } temp;
-    temp.d = value;
-    uint32_t ival = (uint32_t)(temp.i >> 45);
-    int32_t exp = (int32_t)(ival >> 7) - 1023 - fracbits;
-    return (int32_t)(((uint32_t)exp << 8) | s_log2_table[ival & 127]);
+    if (v == 0)
+        return (int32_t)((uint32_t)(-(1023 + fracbits)) << 8);
+    uint64_t n = (uint64_t)v;
+    int p = 63 - __builtin_clzll(n);             /* MSB position */
+    int m7 = (p >= 7) ? (int)((n >> (p - 7)) & 127)
+                      : (int)((n << (7 - p)) & 127);
+    int32_t exp = p - fracbits;
+    return (int32_t)(((uint32_t)exp << 8) | s_log2_table[m7]);
 }
 
-/* base LOD from the texture-coordinate gradients — M3: integerize */
+/* 128-bit CLZ (value != 0). */
+static int clz128(unsigned __int128 v)
+{
+    uint64_t hi = (uint64_t)(v >> 64);
+    return hi ? __builtin_clzll(hi) : 64 + __builtin_clzll((uint64_t)v);
+}
+
+/* fast_log2 of a non-negative 128-bit value (used for the sum-of-squares LOD
+ * gradient). Exact integer form of fast_log2((double)maxval, fracbits): only
+ * the exponent + top 7 mantissa bits are consumed, so this matches the old
+ * double computation while avoiding the float round-trip. */
+static int32_t fast_log2_u128(unsigned __int128 v, int fracbits)
+{
+    if (v == 0)
+        return (int32_t)((uint32_t)(-(1023 + fracbits)) << 8);
+    int p = 127 - clz128(v);
+    int m7 = (p >= 7) ? (int)((v >> (p - 7)) & 127)
+                      : (int)((v << (7 - p)) & 127);
+    int32_t exp = p - fracbits;
+    return (int32_t)(((uint32_t)exp << 8) | s_log2_table[m7]);
+}
+
+/* base LOD from the texture-coordinate gradients (exact 128-bit integer). */
 static int32_t compute_lodbase(int64_t dsdx, int64_t dsdy, int64_t dtdx, int64_t dtdy)
 {
-    double fdsdx = (double)dsdx, fdsdy = (double)dsdy;
-    double fdtdx = (double)dtdx, fdtdy = (double)dtdy;
-    double texdx = fdsdx * fdsdx + fdtdx * fdtdx;
-    double texdy = fdsdy * fdsdy + fdtdy * fdtdy;
-    double maxval = texdx > texdy ? texdx : texdy;
-    return fast_log2(maxval, 64) / 2;
+    unsigned __int128 sx = (unsigned __int128)((__int128)dsdx * dsdx)
+                         + (unsigned __int128)((__int128)dtdx * dtdx);
+    unsigned __int128 sy = (unsigned __int128)((__int128)dsdy * dsdy)
+                         + (unsigned __int128)((__int128)dtdy * dtdy);
+    unsigned __int128 maxval = sx > sy ? sx : sy;
+    return fast_log2_u128(maxval, 64) / 2;
 }
 
-/* fetch a filtered texel (voodoo_soft fetch_texel) — M3: integerize */
+/* fetch a filtered texel (voodoo_soft fetch_texel). Integer perspective:
+ * s = trunc((S*256)/W), t = trunc((T*256)/W) — an exact divide, replacing the
+ * float `iters * (256.0/iterw)`. Affine: s = trunc(S / 2^24). Both truncate
+ * toward zero (C integer division) matching the original (int32) float cast. */
 static argb_t fetch_texel(const vgold_t *g, uint32_t tmode,
-                          double iters, double itert, double iterw, int lodbase)
+                          int64_t iters, int64_t itert, int64_t iterw, int lodbase)
 {
     int32_t s, t, lod = lodbase;
 
     if (TM_persp(tmode)) {
-        double recip = 256.0 / iterw;
-        s = (int32_t)(iters * recip);
-        t = (int32_t)(itert * recip);
-        lod -= fast_log2(iterw, 32);
+        int64_t w = (iterw == 0) ? 1 : iterw;
+        s = (int32_t)(((__int128)iters * 256) / w);
+        t = (int32_t)(((__int128)itert * 256) / w);
+        lod -= fast_log2_i64(iterw, 32);
     } else {
-        s = (int32_t)(iters * (1.0 / (double)(1 << 24)));
-        t = (int32_t)(itert * (1.0 / (double)(1 << 24)));
+        s = (int32_t)(iters / (1 << 24));
+        t = (int32_t)(itert / (1 << 24));
     }
     if (TM_clampnegw(tmode) && iterw < 0)
         s = t = 0;
@@ -946,13 +982,8 @@ static void pixel_pipe(vgold_t *g, const pipectx_t *c, int x, int y,
 
     argb_t texel = { 255, 255, 255, 255 };
     if (c->texturing) {
-        /* M3: integerize — texture sampling currently uses doubles */
-        double iters = (double)(int64_t)us0;
-        double itert = (double)(int64_t)ut0;
-        double iterw = (double)(int64_t)uw0;
-        if (iterw == 0)
-            iterw = 1;
-        argb_t raw = fetch_texel(g, c->tm, iters, itert, iterw, c->lodbase);
+        argb_t raw = fetch_texel(g, c->tm, (int64_t)us0, (int64_t)ut0,
+                                 (int64_t)uw0, c->lodbase);
         argb_t zero = { 0, 0, 0, 0 };
         texel = combine_generic(c->ctex, zero, raw, raw.a, 0);
     }

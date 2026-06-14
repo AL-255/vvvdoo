@@ -95,6 +95,16 @@ module voodoo_top
   logic signed [63:0] px_w, px_s0, px_t0, px_w0;
   logic        pp_pixout_inc;
 
+  // pixel_pipe <-> tmu sample channel (§11b)
+  logic        smp_valid, smp_ready, tex_valid, tex_ready;
+  logic [63:0] smp_s0, smp_t0, smp_w0;
+  logic [7:0]  tex_a, tex_r, tex_g, tex_b;
+  logic [TEX_AW-1:0] trd_addr;
+  logic [15:0] trd_data;
+  logic        tmu_ready;
+  // raster idle (raster's tri_ready) AND tmu_ready gate the launch handshake
+  logic        raster_tri_ready;
+
   // fb_arb client ports (§7.3): 0=lfb_unit, 1=fastfill, 2=pixel_pipe
   logic              c0_req_valid, c0_req_ready, c0_req_we, c0_rsp_valid;
   logic [FB_AW-1:0]  c0_req_addr;
@@ -429,11 +439,16 @@ module voodoo_top
   // ----------------------------------------------------------------
   // raster + pixel pipe ([raster agent], §7 interfaces)
   // ----------------------------------------------------------------
+  // launch handshake: a triangle launches only when BOTH the raster and the
+  // TMU can accept it (CONTRACTS §11b: AND their readies). tri_ready is what
+  // cmd_dispatch / host see; pixel_pipe, raster and tmu all observe it.
+  assign tri_ready = raster_tri_ready & tmu_ready;
+
   raster u_raster (
       .clk        (clk),
       .rst_n      (rst_n),
       .tri_valid  (tri_valid),
-      .tri_ready  (tri_ready),
+      .tri_ready  (raster_tri_ready),
       .tri_params (tri_params),
       .px_valid   (px_valid),
       .px_ready   (px_ready),
@@ -479,7 +494,44 @@ module voodoo_top
       .req_wdata  (c2_req_wdata),
       .rsp_valid  (c2_rsp_valid),
       .rsp_rdata  (c2_rsp_rdata),
+      .smp_valid  (smp_valid),
+      .smp_ready  (smp_ready),
+      .smp_s0     (smp_s0),
+      .smp_t0     (smp_t0),
+      .smp_w0     (smp_w0),
+      .tex_valid  (tex_valid),
+      .tex_ready  (tex_ready),
+      .tex_a      (tex_a),
+      .tex_r      (tex_r),
+      .tex_g      (tex_g),
+      .tex_b      (tex_b),
       .pixout_inc (pp_pixout_inc)
+  );
+
+  // ----------------------------------------------------------------
+  // texture mapping unit (M3) — between pixel_pipe and tex_ram read port
+  // ----------------------------------------------------------------
+  tmu u_tmu (
+      .clk         (clk),
+      .rst_n       (rst_n),
+      .tri_valid   (tri_valid),
+      .tri_ready   (tri_ready),
+      .tri_params  (tri_params),
+      .texbaseaddr (r_texbaseaddr),
+      .tmu_ready   (tmu_ready),
+      .smp_valid   (smp_valid),
+      .smp_ready   (smp_ready),
+      .smp_s0      (smp_s0),
+      .smp_t0      (smp_t0),
+      .smp_w0      (smp_w0),
+      .tex_valid   (tex_valid),
+      .tex_ready   (tex_ready),
+      .tex_a       (tex_a),
+      .tex_r       (tex_r),
+      .tex_g       (tex_g),
+      .tex_b       (tex_b),
+      .trd_addr    (trd_addr),
+      .trd_data    (trd_data)
   );
 
   // ----------------------------------------------------------------
@@ -524,10 +576,12 @@ module voodoo_top
   );
 
   tex_ram u_tex_ram (
-      .clk   (clk),
-      .we    (t_req_be & {2{t_req_valid & t_req_we}}),
-      .addr  (t_req_addr),
-      .wdata (t_req_wdata)
+      .clk     (clk),
+      .we      (t_req_be & {2{t_req_valid & t_req_we}}),
+      .addr    (t_req_addr),
+      .wdata   (t_req_wdata),
+      .addr_r  (trd_addr),
+      .rdata_r (trd_data)
   );
 
 endmodule
