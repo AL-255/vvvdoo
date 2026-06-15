@@ -1,0 +1,46 @@
+Copyright 1986-2022 Xilinx, Inc. All Rights Reserved. Copyright 2022-2025 Advanced Micro Devices, Inc. All Rights Reserved.
+---------------------------------------------------------------------------------------------------------------------------------------------
+| Tool Version : Vivado v.2025.2 (lin64) Build 6299465 Fri Nov 14 12:34:56 MST 2025
+| Date         : Sun Jun 14 22:02:43 2026
+| Host         : AL-TPE16G2 running 64-bit Ubuntu 24.04.4 LTS
+| Command      : report_utilization -hierarchical -file /home/yukidama/github/vvvdoo/fpga/reports/post_route_util_hier.rpt
+| Design       : voodoo_top
+| Device       : xczu15eg-ffvb1156-2-i
+| Speed File   : -2
+| Design State : Routed
+---------------------------------------------------------------------------------------------------------------------------------------------
+
+Utilization Design Information
+
+Table of Contents
+-----------------
+1. Utilization by Hierarchy
+
+1. Utilization by Hierarchy
+---------------------------
+
++------------------+----------------+------------+------------+---------+------+-------+--------+--------+------+------------+
+|     Instance     |     Module     | Total LUTs | Logic LUTs | LUTRAMs | SRLs |  FFs  | RAMB36 | RAMB18 | URAM | DSP Blocks |
++------------------+----------------+------------+------------+---------+------+-------+--------+--------+------+------------+
+| voodoo_top       |          (top) |      33049 |      33049 |       0 |    0 | 22175 |      0 |      0 |    0 |        229 |
+|   (voodoo_top)   |          (top) |          0 |          0 |       0 |    0 |     0 |      0 |      0 |    0 |          0 |
+|   u_cmd_dispatch |   cmd_dispatch |       1919 |       1919 |       0 |    0 |  1653 |      0 |      0 |    0 |          0 |
+|   u_fastfill     |       fastfill |        156 |        156 |       0 |    0 |   118 |      0 |      0 |    0 |          1 |
+|   u_host_if      |        host_if |       3681 |       3681 |       0 |    0 |  3853 |      0 |      0 |    0 |          0 |
+|   u_lfb_unit     |       lfb_unit |        225 |        225 |       0 |    0 |   112 |      0 |      0 |    0 |          1 |
+|   u_pixel_pipe   |     pixel_pipe |       1816 |       1816 |       0 |    0 |   958 |      0 |      0 |    0 |         25 |
+|   u_raster       |         raster |      12409 |      12409 |       0 |    0 |  4890 |      0 |      0 |    0 |         79 |
+|     (u_raster)   |         raster |       3258 |       3258 |       0 |    0 |  3086 |      0 |      0 |    0 |         31 |
+|     u_sl12       |      srt_div_1 |       3039 |       3039 |       0 |    0 |   601 |      0 |      0 |    0 |         16 |
+|     u_sl13       |      srt_div_2 |       3051 |       3051 |       0 |    0 |   602 |      0 |      0 |    0 |         16 |
+|     u_sl23       |      srt_div_3 |       3061 |       3061 |       0 |    0 |   601 |      0 |      0 |    0 |         16 |
+|   u_regfile      | voodoo_regfile |       2756 |       2756 |       0 |    0 |  8684 |      0 |      0 |    0 |          0 |
+|   u_tex_dl       |         tex_dl |        240 |        240 |       0 |    0 |    75 |      0 |      0 |    0 |          0 |
+|   u_tmu          |            tmu |       9823 |       9823 |       0 |    0 |  1797 |      0 |      0 |    0 |        123 |
+|     (u_tmu)      |            tmu |       3610 |       3610 |       0 |    0 |   667 |      0 |      0 |    0 |         91 |
+|     u_srt_s      |        srt_div |       3095 |       3095 |       0 |    0 |   565 |      0 |      0 |    0 |         16 |
+|     u_srt_t      |      srt_div_0 |       3120 |       3120 |       0 |    0 |   565 |      0 |      0 |    0 |         16 |
++------------------+----------------+------------+------------+---------+------+-------+--------+--------+------+------------+
+* Note: The sum of lower-level cells may be larger than their parent cells total, due to cross-hierarchy LUT combining
+
+

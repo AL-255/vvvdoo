@@ -9,3 +9,16 @@ obj_dir/
 *.bin
 tb/traces/*.vvt
 .deps/
+
+# Vivado scratch dropped in the working tree when `make fpga` runs from root
+# (the curated FPGA flow + reports live under fpga/; see fpga/reports/.gitignore)
+.Xil/
+clockInfo.txt
+cong/
+vivado*.jou
+vivado*.log
+*.backup.jou
+*.backup.log
+usage_statistics_webtalk.*
+*_CongestedCLBsAndNets.txt
+.cxl.*

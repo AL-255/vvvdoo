@@ -23,7 +23,7 @@ stream through the RTL — no software rasterizer in the pixel path.*
 | **M3** | TMU: textures (perspective, LOD/mip, point/bilinear, all formats) | ✅ pixel-exact |
 | **M4** | Full pixel pipeline: fog, chroma-key, stipple, alpha/depth, blend | ✅ pixel-exact |
 | **M5** | QEMU RTL-C co-simulation (system test) | ✅ runs GLQuake |
-| **M6** | FPGA bring-up | ⏳ board TBD |
+| **M6** | FPGA synth/impl (ZU15EG): integer backend + SRT divider, 85 MHz | 🟡 OOC done |
 | **M7** | Pipelining / fill-rate (post-GLQuake) | ⏳ |
 
 `make test` is the gate — it is currently **all PIXEL-EXACT** (RTL frame CRC ==
@@ -68,9 +68,11 @@ together.
 The raster/TMU **front-end** (edge coverage, perspective divide, LOD) runs in
 floating point to match MAME exactly. Verilator's `real` is C `double`, so the
 gold model also uses `double` for a consistent, testable `gold == RTL`. That
-front-end is therefore **simulation-only** (not FPGA-synthesizable as written);
-the **pixel pipeline is integer and synthesizable**. Converting the front-end to
-fixed-point / soft-float for FPGA is M6/M7 work. Details:
+front-end is therefore **simulation-only** (not FPGA-synthesizable as written).
+The **integer backend** (`make INT=1`) replaces that front-end with a fixed-point
+datapath — including a radix-4 SRT divider — that *is* FPGA-synthesizable (see
+[FPGA synthesis](#fpga-synthesis-zu15eg) below) while staying RMSE-faithful to the
+float model. Details:
 [`docs/raster-algorithm.md`](docs/raster-algorithm.md),
 [`docs/MAME-VERIFICATION.md`](docs/MAME-VERIFICATION.md).
 
@@ -105,6 +107,27 @@ The GLQuake demo above: GLQuake was launched in QEMU (soft renderer + the device
 records), then replayed through the RTL. The unpipelined core renders it correctly
 end-to-end; throughput is functional-model scale (cycle-accurate, not yet
 pipelined) — fill-rate work is M7.
+
+## FPGA synthesis (ZU15EG)
+
+The integer backend (`make INT=1`, `VOODOO_INT`) is FPGA-synthesizable. An
+out-of-context synth + place + route of `voodoo_top` on a Xilinx Zynq
+UltraScale+ **ZU15EG** (`xczu15eg-ffvb1156-2-i`, Vivado 2025.2) — framebuffer and
+texture treated as external DDR4, as on the real card — gives:
+
+| datapath | area (post-route) | Fmax | critical path |
+|---|---|---:|---|
+| combinational `/` | 39.6k LUT / 19.7k FF / 149 DSP | 14.1 MHz | the integer divide |
+| **+ SRT divider** | 33.0k LUT / 22.2k FF / 229 DSP | **85.5 MHz** | TMU LOD-base DSP chain |
+
+The two combinational divides (perspective `(iters<<8)/iterw`, edge-slope
+`dx·2^20/dy`) were the ~70 ns / ~570-CARRY8 critical path. They are replaced by a
+radix-4 **SRT divider** (`rtl/srt_div.sv`, quotient-selection PLA after the
+Pentium Coe–Tang table) that is bit-identical to `/` — verified over 200k random
+vectors (`make srt-test`) and byte-identical rendered frames — lifting Fmax
+**6.1×** and moving the bottleneck off the divider onto the TMU LOD-base math.
+Reproduce with `make fpga`; details in
+[`fpga/reports/ZU15EG-REPORT.md`](fpga/reports/ZU15EG-REPORT.md).
 
 ## Repository layout
 

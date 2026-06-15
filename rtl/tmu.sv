@@ -383,6 +383,7 @@ module tmu
     S_LODBASE,   // compute_lodbase, then ready
     S_RDY,       // accept sample requests (between pixels)
     S_DIV,       // perspective/affine coordinate
+    S_DIVW,      // VOODOO_INT: wait for the SRT perspective divides
     S_LODCALC,   // resolve LOD + corner coords
     S_ADDR,      // drive trd_addr
     S_RDLAT,     // read latency cycle
@@ -535,27 +536,36 @@ module tmu
             iters = $signed(s0_q); itert = $signed(t0_q); iterw = $signed(w0_q);
             if (iterw == 64'sd0) iterw = 64'sd1;     // div-by-zero guard
             if (tp_q.texmode[0]) begin               // perspective
-              // S = (S/W)/(1/W): direct 64-bit divide, <<8 to land 8 fraction
-              // bits, signed `/` truncates toward zero == float $rtoi(iters*256/
-              // iterw). Replaces a fixed-R_SCALE reciprocal LUT whose s32 output
-              // lost precision for large iterw (recip collapsed to ~9 bits ->
-              // ~0.24% coord error -> texel swim on near/perspective walls, m5).
-              coord_s_q   <= 32'(($signed(iters) <<< 8) / iterw);
-              coord_t_q   <= 32'(($signed(itert) <<< 8) / iterw);
-              // lod_persp = -log2(|1/W|, 32 frac); negative 1/W -> 0 (matches
-              // gold fast_log2's value<0 -> 0). Feed the guarded magnitude as
-              // unsigned 128b; negate the result (the "- fast_log2(iterw,32)").
+              // S = (S/W)/(1/W): the two signed 64-bit divides ((iters<<8)/iterw,
+              // (itert<<8)/iterw) are now done by the radix-4 SRT divider (srt_div,
+              // launched combinationally this cycle); wait for them in S_DIVW. The
+              // result is BIT-IDENTICAL to the `/` it replaces (srt is verified vs
+              // `/`), so the rendered pixels are unchanged -- it just removes the
+              // ~70 ns combinational divide that pinned the design to ~14 MHz.
+              // lod_persp = -log2(|1/W|, 32 frac); negative 1/W -> 0 (no divide).
               lod_persp_q <= iterw[63] ? 32'sd0
                                        : -vd_log2_int({64'd0, $unsigned(iterw)}, 32);
+              state_q <= S_DIVW;
             end else begin                           // affine: /2^24 truncate toward zero
               coord_s_q   <= 32'(vd_asr_trunc64(iters, 24));
               coord_t_q   <= 32'(vd_asr_trunc64(itert, 24));
               lod_persp_q <= 32'sd0;
+              state_q <= S_LODCALC;
             end
             negw_q  <= (iterw < 64'sd0);
-            state_q <= S_LODCALC;
 `endif
           end
+
+`ifdef VOODOO_INT
+          S_DIVW: begin
+            // SRT divides in flight (launched in S_DIV); capture when valid.
+            if (srt_s_valid && srt_t_valid) begin
+              coord_s_q <= srt_s_q[31:0];
+              coord_t_q <= srt_t_q[31:0];
+              state_q   <= S_LODCALC;
+            end
+          end
+`endif
 
           S_LODCALC: begin
             logic signed [31:0] sv, tv;
@@ -666,6 +676,38 @@ module tmu
       end
     end
   end
+
+`ifdef VOODOO_INT
+  // ----------------------------------------------------------------
+  //  radix-4 SRT perspective divides (replaces the combinational `/`)
+  //  S=(iters<<8)/iterw, T=(itert<<8)/iterw with a shared guarded divisor.
+  //  Launched combinationally in S_DIV (perspective); captured in S_DIVW.
+  // ----------------------------------------------------------------
+  logic signed [63:0] srt_b;                       // guarded iterw (!=0)
+  logic               srt_launch;
+  logic signed [63:0] srt_s_q, srt_t_q, srt_s_r, srt_t_r;
+  logic               srt_s_valid, srt_t_valid, srt_s_rdy, srt_t_rdy;
+  logic               srt_s_derr, srt_t_derr;
+
+  assign srt_b      = (w0_q == 64'sd0) ? 64'sd1 : w0_q;
+  assign srt_launch = (state_q == S_DIV) && tp_q.texmode[0];
+
+  srt_div #(.W(64)) u_srt_s (
+      .clk(clk), .rst_n(rst_n),
+      .in_valid(srt_launch), .in_ready(srt_s_rdy),
+      .a($signed(s0_q) <<< 8), .b(srt_b),
+      .out_valid(srt_s_valid), .q(srt_s_q), .r(srt_s_r), .derr(srt_s_derr));
+  srt_div #(.W(64)) u_srt_t (
+      .clk(clk), .rst_n(rst_n),
+      .in_valid(srt_launch), .in_ready(srt_t_rdy),
+      .a($signed(t0_q) <<< 8), .b(srt_b),
+      .out_valid(srt_t_valid), .q(srt_t_q), .r(srt_t_r), .derr(srt_t_derr));
+
+  // S_DIVW gates on out_valid; ready/remainder/derr are not needed here.
+  logic srt_unused;
+  assign srt_unused = &{1'b0, srt_s_q[63:32], srt_t_q[63:32], srt_s_r, srt_t_r,
+                        srt_s_rdy, srt_t_rdy, srt_s_derr, srt_t_derr};
+`endif
 
   // unused sink — tri_params fields not consumed by the TMU, the upper
   // texBaseAddr bits (only [18:0] matter), and a few derived bits.

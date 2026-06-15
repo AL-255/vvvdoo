@@ -96,6 +96,7 @@ module raster
   typedef enum logic [3:0] {
     R_IDLE,       // wait for tri_valid
     R_SETUP,      // compute float coverage scalars; bail if no rows
+    R_SLOPEW,     // VOODOO_INT: wait for the SRT edge-slope divides
     R_ROWINIT,    // rowP[ch] = startP[ch] + (curscan-oy)*dPdY
     R_SPAN,       // float startx/stopx -> [left,right); empty test
     R_SPANINIT,   // pixP[ch] = rowP[ch] + (left-ox)*dPdX
@@ -137,7 +138,9 @@ module raster
   // rows), so the per-scanline edge X tracks the float double slope with no
   // long-edge drift. v1,v2 per-scanline; v3 only feeds the precomputed slopes.
   logic signed [31:0] v1x_q, v1y_q, v2x_q, v2y_q;   // S27.4 (4 frac bits)
+  logic signed [31:0] v3x_q, v3y_q;                 // 3rd sorted vert (slopes)
   logic signed [63:0] dxdy13_q, dxdy12_q, dxdy23_q; // dX/dY at 2^VD_SLOPE_FRAC
+  logic               slv_started;                  // SRT slope launch flag
 `endif
 
   // ----------------------------------------------------------------
@@ -262,6 +265,7 @@ module raster
       dxdy13_q <= 0.0; dxdy12_q <= 0.0; dxdy23_q <= 0.0;
 `else
       v1x_q <= '0; v1y_q <= '0; v2x_q <= '0; v2y_q <= '0;
+      v3x_q <= '0; v3y_q <= '0; slv_started <= 1'b0;
       dxdy13_q <= '0; dxdy12_q <= '0; dxdy23_q <= '0;
 `endif
       ox_q <= '0; yend_q <= '0;
@@ -426,16 +430,14 @@ module raster
           end
           v1x_q <= s1x; v1y_q <= s1y;
           v2x_q <= s2x; v2y_q <= s2y;
+          v3x_q <= s3x; v3y_q <= s3y;   // 3rd vert kept for the slope divides
 
           // slope = dX/dY at 2^VD_SLOPE_FRAC from the FULL S11.4 dY (the .4
-          // scales cancel) — near-exact, so edge X tracks the float double
-          // slope with no long-edge drift. 0 for a horizontal edge.
-          dxdy13_q <= (s3y != s1y)
-            ? ((64'($signed(s3x - s1x)) <<< VD_SLOPE_FRAC) / 64'($signed(s3y - s1y))) : 64'sd0;
-          dxdy12_q <= (s2y != s1y)
-            ? ((64'($signed(s2x - s1x)) <<< VD_SLOPE_FRAC) / 64'($signed(s2y - s1y))) : 64'sd0;
-          dxdy23_q <= (s3y != s2y)
-            ? ((64'($signed(s3x - s2x)) <<< VD_SLOPE_FRAC) / 64'($signed(s3y - s2y))) : 64'sd0;
+          // scales cancel). The three signed 64-bit divides are now done by the
+          // radix-4 SRT divider (srt_div) over R_SLOPEW; srt is verified BIT-
+          // IDENTICAL to the `/` it replaces (a horizontal edge -> divisor 0 ->
+          // derr -> quotient 0, matching the old dy==0 -> 0 guard), so coverage
+          // is unchanged -- it just removes the ~70 ns combinational divide.
 
           // first/end row = round_coordinate(yTop/yBottom) (round-nearest,
           // ties down) to match the float Y range; rows [iy1, iy3). Clip to [ct,cb).
@@ -451,8 +453,9 @@ module raster
             state_q <= R_FLUSH;          // no candidate rows at all
           else begin
             // seed dy0 = curscan - oy for the first scanline's R_ROWINIT
-            dy0_q   <= iy1 - (32'($signed(ay_q)) >>> 4);
-            state_q <= R_ROWINIT;
+            dy0_q       <= iy1 - (32'($signed(ay_q)) >>> 4);
+            slv_started <= 1'b0;
+            state_q     <= R_SLOPEW;   // launch + await the SRT slope divides
           end
 `endif
           // iterator origin = ORIGINAL vertex A, arithmetic floor (gold asr32);
@@ -460,6 +463,20 @@ module raster
           // integer iterators). Outside the `ifdef so it is shared.
           ox_q <= 32'($signed(ax_q)) >>> 4;
         end
+
+`ifdef VOODOO_INT
+        R_SLOPEW: begin
+          // first cycle launches the three SRT divides (combinational gate);
+          // then wait for them and capture the edge slopes.
+          if (!slv_started) slv_started <= 1'b1;
+          else if (slope_valid) begin
+            dxdy13_q <= slope13_q;
+            dxdy12_q <= slope12_q;
+            dxdy23_q <= slope23_q;
+            state_q  <= R_ROWINIT;
+          end
+        end
+`endif
 
         R_ROWINIT: begin
           // rowP = startP + (curscan-oy)*dPdY  (mod 2^32 / 2^64)
@@ -587,6 +604,44 @@ module raster
       endcase
     end
   end
+
+`ifdef VOODOO_INT
+  // ----------------------------------------------------------------
+  //  radix-4 SRT edge-slope divides (replaces the combinational `/`):
+  //  dX/dY at 2^VD_SLOPE_FRAC for edges 1-3, 1-2, 2-3. Launched in the first
+  //  R_SLOPEW cycle (slope_launch), captured when slope_valid. A horizontal
+  //  edge -> divisor 0 -> derr -> quotient 0 (== the old dy==0 guard).
+  // ----------------------------------------------------------------
+  logic               slope_launch, slope_valid, sl12_v, sl23_v;
+  logic               sl13_rdy, sl12_rdy, sl23_rdy;
+  logic               sl13_de, sl12_de, sl23_de;
+  logic signed [63:0] slope13_q, slope12_q, slope23_q;
+  logic signed [63:0] sl13_r, sl12_r, sl23_r;
+
+  assign slope_launch = (state_q == R_SLOPEW) && !slv_started;
+
+  srt_div #(.W(64)) u_sl13 (
+      .clk(clk), .rst_n(rst_n), .in_valid(slope_launch), .in_ready(sl13_rdy),
+      .a(64'($signed(v3x_q - v1x_q)) <<< VD_SLOPE_FRAC),
+      .b(64'($signed(v3y_q - v1y_q))),
+      .out_valid(slope_valid), .q(slope13_q), .r(sl13_r), .derr(sl13_de));
+  srt_div #(.W(64)) u_sl12 (
+      .clk(clk), .rst_n(rst_n), .in_valid(slope_launch), .in_ready(sl12_rdy),
+      .a(64'($signed(v2x_q - v1x_q)) <<< VD_SLOPE_FRAC),
+      .b(64'($signed(v2y_q - v1y_q))),
+      .out_valid(sl12_v), .q(slope12_q), .r(sl12_r), .derr(sl12_de));
+  srt_div #(.W(64)) u_sl23 (
+      .clk(clk), .rst_n(rst_n), .in_valid(slope_launch), .in_ready(sl23_rdy),
+      .a(64'($signed(v3x_q - v2x_q)) <<< VD_SLOPE_FRAC),
+      .b(64'($signed(v3y_q - v2y_q))),
+      .out_valid(sl23_v), .q(slope23_q), .r(sl23_r), .derr(sl23_de));
+
+  // all three share latency; R_SLOPEW gates on slope_valid (edge 1-3). The
+  // other valids / ready / remainder / derr lines are not needed here.
+  logic slope_unused;
+  assign slope_unused = &{1'b0, sl12_v, sl23_v, sl13_rdy, sl12_rdy, sl23_rdy,
+                          sl13_de, sl12_de, sl23_de, sl13_r, sl12_r, sl23_r};
+`endif
 
   // tri_params fields consumed by the pixel pipe only (raster passes the
   // iterator stream; the pipe latches its own copy of tri_params per §7.2)

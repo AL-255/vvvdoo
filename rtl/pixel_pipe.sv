@@ -755,7 +755,9 @@ module pixel_pipe
           if (lfb_mode_q) begin
             ir_q <= er_q; ig_q <= eg_q; ib_q <= eb_q; ia_q <= ea_q;
             // clamped_z(sz<<12)>>8 ; clamped_w(ewsel?za<<16:sz<<16)
-            czh_q <= clamped_zf(32'($signed({esz_q, 12'b0})), tp_q.fbzcp[28])[15:8];
+            // (bits [15:8] of clamped_zf; written as shift+truncate because a
+            // bit-select directly on a function call is not legal IEEE 1800.)
+            czh_q <= 8'(clamped_zf(32'($signed({esz_q, 12'b0})), tp_q.fbzcp[28]) >> 8);
             // LFB iterw = (uint32)(sz<<16) or (uint32)(za<<16): bits[47:32]=0,
             // so clamped_w reads 0 (gold lfb_pixel_pipeline).
             cw_q  <= clamped_wf(16'h0, tp_q.fbzcp[28]);

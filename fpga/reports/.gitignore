@@ -1,0 +1,12 @@
+# Generated Vivado artifacts. Regenerate the whole set with `make fpga`.
+# Tracked (curated evidence): SUMMARY.txt, ZU15EG-REPORT.md, *_util*.rpt.
+# Ignored: checkpoints, logs, and the verbose per-path timing dumps.
+*.dcp
+*.log
+*.jou
+*.pb
+*.out
+*_timing.rpt
+*_worst_paths.rpt
+int_baseline.md5
+.Xil/

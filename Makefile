@@ -159,7 +159,33 @@ $(BUILD)/unit_%: tb/unit/%.cpp $(BUILD)/libvgold.a
 unit: $(UNIT_BINS)
 	@set -e; for t in $(UNIT_BINS); do echo "== $$t"; $$t; done
 
+# ---------------- SRT divider standalone verification ----------------
+# Verilates rtl/srt_div.sv on its own with a self-checking C++ harness that
+# diffs q/r against C `/`,`%` over directed + 200k random signed-64 vectors.
+.PHONY: srt-test srt-test-pipe
+srt-test:
+	$(VERILATOR) --cc --exe --build -j 0 -Mdir $(BUILD)/srt_obj \
+	  --top-module srt_div -Wall -Wno-fatal \
+	  rtl/srt_div.sv tb/srt/tb_srt_div.cpp -o srt_div_tb
+	$(BUILD)/srt_obj/srt_div_tb
+
+srt-test-pipe:
+	$(VERILATOR) --cc --exe --build -j 0 -Mdir $(BUILD)/srt_obj_pipe \
+	  --top-module srt_div -GPIPELINED=1 -Wall -Wno-fatal \
+	  rtl/srt_div.sv tb/srt/tb_srt_div.cpp -o srt_div_tb_pipe
+	$(BUILD)/srt_obj_pipe/srt_div_tb_pipe
+
 test: unit test-m1 test-m2 test-m3 test-m4 test-m5
+
+# FPGA out-of-context synth+impl on Zynq UltraScale+ ZU15EG (integer backend).
+# Requires Vivado on PATH. Reports land in fpga/reports/ (see ZU15EG-REPORT.md).
+# Override the target period (ns): make fpga FPGA_PERIOD=4.0
+FPGA_PERIOD ?= 4.0
+.PHONY: fpga
+fpga:
+	vivado -nojournal -log fpga/reports/vivado.log -mode batch \
+	       -source fpga/syn/synth_zu15eg.tcl -tclargs $(FPGA_PERIOD)
+	@cat fpga/reports/SUMMARY.txt
 
 clean:
 	rm -rf $(BUILD)

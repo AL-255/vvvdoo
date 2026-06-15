@@ -1,0 +1,7 @@
+part            xczu15eg-ffvb1156-2-i
+target_period   4.0 ns
+WNS             -7.701 ns
+Fmax            85.5 MHz
+luts            0
+regs            22175
+dsps            229
