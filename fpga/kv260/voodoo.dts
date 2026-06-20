@@ -1,0 +1,29 @@
+/dts-v1/;
+/plugin/;
+
+/* Device-tree overlay for the vvvdoo accelerated application on KV260.
+ * Tells fpga_manager which bitstream to load and exposes the two AXI slave
+ * windows to userspace as generic-uio nodes. See fpga/kv260/README.md §6.
+ *
+ * Compile: dtc -@ -O dtb -o voodoo.dtbo voodoo.dts
+ *
+ * NOTE: generic-uio is NOT auto-bound on stock PetaLinux / Ubuntu-on-Kria; it
+ * needs the kernel bootarg `uio_pdrv_genirq.of_id=generic-uio` (edits the SOM
+ * boot partition — the riskiest step). PRIMARY bring-up uses /dev/mem + mmap
+ * (O_SYNC) at 0x8000_0000 instead; promote to UIO as a hardening step.
+ */
+
+&fpga_full {
+    firmware-name = "voodoo.bit.bin";
+};
+
+&amba {
+    voodoo_bar@80000000 {
+        compatible = "generic-uio";
+        reg = <0x0 0x80000000 0x0 0x01000000>;   /* 16 MB device aperture -> /dev/uio0 */
+    };
+    voodoo_stat@80010000 {
+        compatible = "generic-uio";
+        reg = <0x0 0x80010000 0x0 0x00010000>;   /* 64 KB STAT sideband   -> /dev/uio1 */
+    };
+};

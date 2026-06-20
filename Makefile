@@ -187,5 +187,10 @@ fpga:
 	       -source fpga/syn/synth_zu15eg.tcl -tclargs $(FPGA_PERIOD)
 	@cat fpga/reports/SUMMARY.txt
 
+# KV260 board-deployment targets (kv260-lint/-fit/-bit/-pkg, cosim-lib-hw).
+# Board RTL lives in fpga/kv260/rtl/ (out of the rtl/*.sv glob) so these never
+# perturb `make test`. See fpga/kv260/README.md.
+include fpga/kv260/Makefile.frag
+
 clean:
 	rm -rf $(BUILD)
