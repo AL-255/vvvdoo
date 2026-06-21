@@ -23,7 +23,7 @@ stream through the RTL — no software rasterizer in the pixel path.*
 | **M3** | TMU: textures (perspective, LOD/mip, point/bilinear, all formats) | ✅ pixel-exact |
 | **M4** | Full pixel pipeline: fog, chroma-key, stipple, alpha/depth, blend | ✅ pixel-exact |
 | **M5** | QEMU RTL-C co-simulation (system test) | ✅ runs GLQuake |
-| **M6** | FPGA: ZU15EG OOC (85 MHz) · KV260 PL routed (50 MHz, FB→DDR4, texture→URAM) | 🟡 P&R done; board bring-up WIP |
+| **M6** | FPGA: ZU15EG OOC (85 MHz) · KV260 PL routed @ 70 MHz (FB→DDR4, texture→URAM) | 🟡 P&R done; board bring-up WIP |
 | **M7** | Pipelining / fill-rate (post-GLQuake) | ⏳ |
 
 `make test` is the gate — it is currently **all PIXEL-EXACT** (RTL frame CRC ==
@@ -135,8 +135,9 @@ The integer backend is being brought up on a **Xilinx Kria KV260** (`xck26`): an
 emulator on the PS Arm cores drives the Voodoo RTL in the PL over AXI, with the
 framebuffer in PS DDR4 and texture in URAM. The full PL IP (`voodoo_pl_top` = AXI host
 bridge + integer core + SRT dividers + DDR framebuffer adapter) **synthesizes, places
-and routes** on `xck26-2LV` and **meets timing at 50 MHz** (WNS +3.05 ns). Device view
-of the routed design, colored by RTL hierarchy:
+and routes** on `xck26-2LV` and **meets timing at 70 MHz** (WNS +0.11 ns, after
+pipelining the TMU LOD-base and bilinear/combine cones). Device view of the routed
+design, colored by RTL hierarchy:
 
 ![KV260 routed device view, colored by hierarchy](fpga/kv260/device_view.png)
 

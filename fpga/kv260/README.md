@@ -82,6 +82,43 @@ and `fb_arb`'s tag FIFO (cyan) are tiny. Texture is 32 URAM (the 50 % URAM colum
 the framebuffer is off-chip in PS DDR4 (no BRAM). Reproduce: `make kv260-impl` then
 `make kv260-view`.
 
+### Timing closure — 50 and 70 MHz close; ≥100 MHz is M7
+
+`make kv260-impl` (default 20 ns) closes **50 MHz with +3.05 ns margin**.
+
+**100 MHz, directives only — does not close.** A parallel sweep of three strategies
+(`impl_pl_top.tcl -tclargs 10.0 <tag> {explore|timing|spread}`, each adding synthesis
+**retiming** + place/route Explore/ExtraTimingOpt/AggressiveExplore) all converge to
+**WNS −0.65 ns → 67 MHz at the 14.286 ns (70 MHz) constraint**. Identical results across
+directives = the limiter is a fixed combinational cone, not something P&R can shave. The
+barrier is a cluster of single-cycle cones (~40 % routing) that re-surface tier on tier:
+
+| Tier | Path (≈ delay) | What it is |
+|---|---|---|
+| 1 | `u_tmu/value3 → lodbase_q` (14.9 ns) | LOD-base: 4× 64-bit squarings + 128-bit sums + `vd_log2_int` |
+| 2 | `u_tmu/{s,t}frac_q → comb_q` (14.2 ns) | bilinear blend (16 weighted texel MACs) + texel combine |
+| 3 | `u_raster/y_q → last_q` (13.2 ns) | per-scanline span/edge endpoint |
+| 4 | … (~12–13 ns) | further raster/TMU per-pixel cones |
+
+**70 MHz — CLOSES (`make kv260-impl70`).** Tiers 1 and 2 are each split across two FSM
+states (cheap, since the TMU already serializes per pixel):
+
+- **Tier 1, LOD-base:** `S_LODBASE` registers the four gradient sums-of-squares →
+  `S_LODBASE2` does max + `vd_log2_int` (INT path only).
+- **Tier 2, bilinear/combine:** `S_BLEND` registers the 16-MAC blended texel `bl_*` →
+  `S_BLEND2` runs `tex_combine` (shared path).
+
+Both are pure register placement — the computed `lodbase`/`comb` values are unchanged —
+verified by `make test` (PIXEL-EXACT) **and** byte-identical INT=1 cosim frames. With
+both, the design **meets 70 MHz: WNS +0.11 ns → 70.5 MHz.**
+
+The margin stays thin because tier 3 — a **raster** span/setup cone (`v1y_q → ch_q`,
+14.05 ns) — is the new limiter, and the raster engine has its own family of ~14 ns
+per-scanline cones. So the ~14 ns ceiling is pervasive across **both** the TMU sampler
+and the raster span engine. Pushing past 70 MHz (toward 85–100 MHz) means pipelining the
+raster span/edge DDA and the remaining cones too — the **M7 fill-rate/pipelining**
+milestone. The design routes clean at 70 MHz today.
+
 ---
 
 ## 1. Architecture overview

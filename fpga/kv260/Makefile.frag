@@ -6,7 +6,7 @@
 VOODOO_INC := $(abspath vvvdoo-refs/06-qemu-voodoo/src)
 KV260_RTL  := $(wildcard fpga/kv260/rtl/*.sv)
 
-.PHONY: kv260-lint kv260-fit kv260-pl-fit kv260-impl kv260-view kv260-bit kv260-pkg kv260-install cosim-lib-hw
+.PHONY: kv260-lint kv260-fit kv260-pl-fit kv260-impl kv260-impl70 kv260-view kv260-bit kv260-pkg kv260-install cosim-lib-hw
 
 # lint the WHOLE board PL IP (axi_voodoo_slave + board voodoo_top + fb_ddr_adapter)
 # in its real config; does not touch the core `make lint`.
@@ -30,6 +30,11 @@ kv260-pl-fit:
 kv260-impl:
 	vivado -mode batch -source fpga/kv260/impl_pl_top.tcl
 	@echo "see fpga/reports/kv260_impl_{util,timing}.rpt + kv260_placement.txt"
+
+# 70 MHz timing-closed run (retiming + Explore directives; pipelined LOD-base)
+kv260-impl70:
+	vivado -mode batch -source fpga/kv260/impl_pl_top.tcl -tclargs 14.286 70 explore
+	@cat fpga/reports/kv260_impl70_timing.rpt | grep -A2 'Design Timing Summary' | head -4 || true
 
 # render the hierarchy-colored device view PNG from the placement dump.
 # Needs Pillow (pip install Pillow); text uses Liberation Sans (Arial-compatible).

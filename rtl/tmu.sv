@@ -162,6 +162,12 @@ module tmu
   end
 
   logic signed [31:0] lodbase_q;
+`ifdef VOODOO_INT
+  // LOD-base pipeline regs: stage S_LODBASE computes the gradient sums-of-squares
+  // into these, stage S_LODBASE2 does max + log2. Splits the ~15 ns single-cycle
+  // LOD cone (the Fmax limiter) so the board closes 70 MHz. Value is unchanged.
+  logic [127:0] texdx_q, texdy_q;
+`endif
 
   // ================================================================
   //  per-pixel state
@@ -360,6 +366,10 @@ module tmu
 
   // bilinear blend combinational
   logic [7:0] bl_a, bl_r, bl_g, bl_b;
+  // blended-texel pipeline regs: S_BLEND registers these (the 16 weighted-texel
+  // MACs), S_BLEND2 runs tex_combine -> comb_q. Splits the ~14 ns blend+combine
+  // cone (tier-2 Fmax limiter) so the board clears 70 MHz with margin.
+  logic [7:0] bl_a_q, bl_r_q, bl_g_q, bl_b_q;
   always_comb begin
     int isf, itf, w00, w10, w01, w11;
     isf = 256 - int'(sfrac_q);
@@ -380,7 +390,8 @@ module tmu
   typedef enum logic [3:0] {
     S_IDLE,      // ready for triangle launch
     S_LOD,       // lodoffset accumulation
-    S_LODBASE,   // compute_lodbase, then ready
+    S_LODBASE,   // compute_lodbase: gradients^2 -> texdx/texdy
+    S_LODBASE2,  // VOODOO_INT: max + log2 -> lodbase (pipelined for Fmax)
     S_RDY,       // accept sample requests (between pixels)
     S_DIV,       // perspective/affine coordinate
     S_DIVW,      // VOODOO_INT: wait for the SRT perspective divides
@@ -389,7 +400,8 @@ module tmu
     S_RDLAT,     // read latency cycle
     S_EXPAND,    // raw_w settled; ex_* valid -> capture corner
     S_NEXT,      // advance corner / finish
-    S_BLEND,     // bilinear blend + combine (e_* settled)
+    S_BLEND,     // bilinear blend -> bl_*_q (e_* settled)
+    S_BLEND2,    // tex_combine(bl_*) -> comb_q (pipelined for Fmax)
     S_RESP       // present tex_valid
   } st_e;
   st_e state_q;
@@ -416,6 +428,9 @@ module tmu
       acc_q     <= '0;
       li_q      <= '0;
       lodbase_q <= '0;
+`ifdef VOODOO_INT
+      texdx_q <= '0; texdy_q <= '0;
+`endif
       lodoff_q  <= '{default:'0};
       s0_q <= '0; t0_q <= '0; w0_q <= '0;
       coord_s_q <= '0; coord_t_q <= '0; lod_persp_q <= '0; negw_q <= 1'b0;
@@ -423,6 +438,7 @@ module tmu
       sfrac_q <= '0; tfrac_q <= '0;
       cs_ss <= '0; cs_s1 <= '0; cs_tt <= '0; cs_t1 <= '0;
       corner_q <= '0; comb_q <= '0; raw_w <= '0; cs_unused <= 1'b0;
+      bl_a_q <= '0; bl_r_q <= '0; bl_g_q <= '0; bl_b_q <= '0;
       e_a <= '{default:'0}; e_r <= '{default:'0};
       e_g <= '{default:'0}; e_b <= '{default:'0};
     end else begin
@@ -477,22 +493,32 @@ module tmu
 `else
             // ---- INTEGER path (VOODOO_INT, SPEC §6.1 / PLAN §3.2-B) ----
             // Exact 128-bit sum-of-squares of the s32 14.18 S/T gradients
-            // (widen to s64 before squaring; product fits 128b), take the max,
-            // then integer log2 (fracbits=64) >>> 1 = /2 of the sqrt. The /2 is
-            // an arithmetic shift; log2(max) >= 0 here so >>> 1 == toward zero.
+            // (widen to s64 before squaring; product fits 128b). PIPELINED: this
+            // stage registers texdx/texdy (the 4 squarings + 128-bit sums = the DSP
+            // half of the LOD cone); S_LODBASE2 does the max + log2. Result is
+            // identical to the old single-cycle form; the split lifts Fmax (the
+            // single-cycle LOD cone was the board's ~15 ns critical path).
             logic signed [63:0] gx0, gy0, gx1, gy1;
-            logic [127:0]       texdx, texdy, maxv;
             gx0 = 64'($signed(tp_q.ds0dx)); gy0 = 64'($signed(tp_q.dt0dx));
             gx1 = 64'($signed(tp_q.ds0dy)); gy1 = 64'($signed(tp_q.dt0dy));
-            texdx = 128'($signed(gx0) * $signed(gx0))
-                  + 128'($signed(gy0) * $signed(gy0));   // exact, ~128b
-            texdy = 128'($signed(gx1) * $signed(gx1))
-                  + 128'($signed(gy1) * $signed(gy1));
-            maxv  = (texdx > texdy) ? texdx : texdy;
-            lodbase_q <= vd_log2_int(maxv, 64) >>> 1;     // /2 toward zero (log2>=0)
-            state_q   <= S_RDY;
+            texdx_q <= 128'($signed(gx0) * $signed(gx0))
+                     + 128'($signed(gy0) * $signed(gy0));   // exact, ~128b
+            texdy_q <= 128'($signed(gx1) * $signed(gx1))
+                     + 128'($signed(gy1) * $signed(gy1));
+            state_q <= S_LODBASE2;
 `endif
           end
+
+`ifdef VOODOO_INT
+          S_LODBASE2: begin
+            // max + integer log2 (fracbits=64) >>> 1 = /2 of the sqrt. The /2 is
+            // an arithmetic shift; log2(max) >= 0 here so >>> 1 == toward zero.
+            logic [127:0] maxv;
+            maxv      = (texdx_q > texdy_q) ? texdx_q : texdy_q;
+            lodbase_q <= vd_log2_int(maxv, 64) >>> 1;
+            state_q   <= S_RDY;
+          end
+`endif
 
           S_RDY: begin
             if (smp_valid) begin
@@ -662,7 +688,13 @@ module tmu
           end
 
           S_BLEND: begin
-            comb_q  <= tex_combine(tp_q.texmode, bl_r, bl_g, bl_b, bl_a);
+            // register the bilinear-blended texel (16 weighted MACs); combine next
+            bl_a_q <= bl_a; bl_r_q <= bl_r; bl_g_q <= bl_g; bl_b_q <= bl_b;
+            state_q <= S_BLEND2;
+          end
+
+          S_BLEND2: begin
+            comb_q  <= tex_combine(tp_q.texmode, bl_r_q, bl_g_q, bl_b_q, bl_a_q);
             state_q <= S_RESP;
           end
 
