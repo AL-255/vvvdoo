@@ -31,7 +31,8 @@ kv260-impl:
 	vivado -mode batch -source fpga/kv260/impl_pl_top.tcl
 	@echo "see fpga/reports/kv260_impl_{util,timing}.rpt + kv260_placement.txt"
 
-# render the hierarchy-colored device view PNG from the placement dump (pure python)
+# render the hierarchy-colored device view PNG from the placement dump.
+# Needs Pillow (pip install Pillow); text uses Liberation Sans (Arial-compatible).
 kv260-view:
 	python3 fpga/kv260/plot_device.py fpga/reports/kv260_placement.txt fpga/kv260/device_view.png
 
