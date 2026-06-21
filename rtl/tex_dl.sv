@@ -167,7 +167,7 @@ module tex_dl
 
   // write beats: bpt1 = four byte writes at base_b+i; bpt2 = two 16-bit
   // writes at base_b and base_b+2 (byte address rounded down to the word)
-  logic [20:0] wb_addr;
+  logic [TEX_AW:0] wb_addr;   // texture byte address (TEX_AW+1 bits; reduced-tex aware)
   logic [7:0]  wb_byte;
   always_comb begin
     req_valid = 1'b0;
@@ -176,18 +176,18 @@ module tex_dl
     req_wdata = '0;
     req_be    = 2'b00;
     wr_done   = 1'b0;
-    wb_addr   = base_b + {19'b0, wi_q};              // 21-bit wrap == & texmask
+    wb_addr   = (TEX_AW+1)'(base_b + {19'b0, wi_q});  // wrap mod 2^(TEX_AW+1) == & texmask
     wb_byte   = d_q[{wi_q, 3'b000} +: 8];
     if (state_q == T_WR) begin
       req_valid = 1'b1;
       req_we    = 1'b1;
       if (!bpt2) begin
-        req_addr  = wb_addr[20:1];
+        req_addr  = wb_addr[TEX_AW:1];                // word addr (TEX_AW bits)
         req_be    = wb_addr[0] ? 2'b10 : 2'b01;
         req_wdata = {wb_byte, wb_byte};
       end else begin
-        req_addr  = (wi_q == 2'd0) ? base_b[20:1]
-                                   : (base_b[20:1] + 20'd1); // (base+2)>>1
+        req_addr  = (wi_q == 2'd0) ? base_b[TEX_AW:1]
+                                   : (base_b[TEX_AW:1] + TEX_AW'(1)); // (base+2)>>1
         req_be    = 2'b11;
         req_wdata = (wi_q == 2'd0) ? d_q[15:0] : d_q[31:16];
       end

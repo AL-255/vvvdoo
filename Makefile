@@ -96,6 +96,30 @@ test-m4: vsim traces
 test-m5: vsim traces
 	$(BUILD)/vsim tb/traces/m5_texfmt.vvt
 
+# DDR-readiness check: rebuild the trace-diff with the FB_LAT_INJECT memory model
+# (variable read latency + back-pressure on the fb port) and require all five
+# frames to stay byte-identical to gold -- proves the fb_arb tag FIFO and the
+# lfb/fastfill/pixel_pipe clients tolerate PS-DDR4 latency before real DDR exists.
+.PHONY: test-fblat
+test-fblat: $(RTL_SRCS) $(RTL_CFG) tb/frame/tb_main.cpp $(BUILD)/libvgold.a traces
+	$(VERILATOR) $(VSIM_FLAGS) -Mdir $(BUILD)/vsim_objfblat -o vsimfblat \
+	    +define+FB_LAT_INJECT $(RTL_CFG) $(RTL_SRCS) $(abspath tb/frame/tb_main.cpp)
+	@set -e; for t in m1_fill_lfb m2_tri_gouraud m3_selftest_full m4_pipeline m5_texfmt; do \
+	  echo "== fblat $$t"; $(BUILD)/vsim_objfblat/vsimfblat tb/traces/$$t.vvt; done
+
+# End-to-end functional verification of fb_ddr_adapter: build the trace-diff with
+# the adapter -> behavioral AXI memory (axi_mem_sim) -> fb_ram loop and require all
+# five frames byte-identical to gold. Verifies the adapter's AXI4 FSM + narrow
+# (2-byte) addressing + lane muxing without Vivado. Board RTL added to the build.
+.PHONY: test-fbddr
+test-fbddr: $(RTL_SRCS) $(RTL_CFG) tb/frame/tb_main.cpp $(BUILD)/libvgold.a traces
+	$(VERILATOR) $(VSIM_FLAGS) -Mdir $(BUILD)/vsim_objfbddr -o vsimfbddr \
+	    +define+FB_DDR_SIM $(RTL_CFG) $(RTL_SRCS) \
+	    $(abspath fpga/kv260/rtl/fb_ddr_adapter.sv) $(abspath fpga/kv260/rtl/axi_mem_sim.sv) \
+	    $(abspath tb/frame/tb_main.cpp)
+	@set -e; for t in m1_fill_lfb m2_tri_gouraud m3_selftest_full m4_pipeline m5_texfmt; do \
+	  echo "== fbddr $$t"; $(BUILD)/vsim_objfbddr/vsimfbddr tb/traces/$$t.vvt; done
+
 # ---------------- RTL-C co-simulation harness ----------------
 COSIM_FLAGS := --cc --exe --build -O3 -j 0 --top-module $(RTL_TOP) \
                -CFLAGS "-std=c++17 -O2"

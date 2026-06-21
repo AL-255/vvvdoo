@@ -337,7 +337,7 @@ module tmu
   logic              byte_hi;
   always_comb begin
     logic [16:0] tprod, ts;
-    logic [20:0] ba;   // byte address, wraps mod 2^21 == & TEX_MASK
+    logic [TEX_AW:0] ba;   // byte address, wraps mod 2^(TEX_AW+1) (reduced-tex aware)
     unique case (corner_q)
       2'd0: begin cur_s = cs_ss; cur_t = cs_tt; end
       2'd1: begin cur_s = cs_s1; cur_t = cs_tt; end
@@ -347,11 +347,11 @@ module tmu
     tprod = 17'(cur_t) * (17'(smax_q) + 17'd1);
     ts    = tprod + 17'(cur_s);
     if (!bpt2) begin
-      ba        = texbase_q + {4'b0, ts};        // (texbase + t + s) & TEX_MASK
+      ba        = (TEX_AW+1)'(texbase_q + {4'b0, ts});       // (texbase + t + s) & TEX_MASK
       word_addr = ba[TEX_AW:1];                  // byte >> 1
       byte_hi   = ba[0];
     end else begin
-      ba        = texbase_q + {3'b0, ts, 1'b0};  // (texbase + 2*(t+s)) & TEX_MASK
+      ba        = (TEX_AW+1)'(texbase_q + {3'b0, ts, 1'b0}); // (texbase + 2*(t+s)) & TEX_MASK
       word_addr = ba[TEX_AW:1];                  // & ~1 -> drop byte bit0
       byte_hi   = 1'b0;
     end

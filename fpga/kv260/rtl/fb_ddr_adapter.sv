@@ -1,90 +1,130 @@
-// fb_ddr_adapter.sv — SKELETON (M7, NOT YET FUNCTIONAL).
+// fb_ddr_adapter.sv — framebuffer memory port -> PS DDR4 (KV260 S_AXI_HP), as an
+// AXI4 master. Drop-in for the on-chip fb_ram glue: presents fb_arb's RAM-side
+// handshake (req_valid/ready, we/addr/wdata, rd_valid/rdata) and turns each 16-bit
+// framebuffer word access into a 2-byte AXI transfer at FB_BASE_BYTES + word*2.
 //
-// Intended to replace the on-chip fb_ram instance in voodoo_top: bridge the
-// framebuffer RAM-side port to an AXI4 master into PS DDR4 (KV260 S_AXI_HP0_FPD),
-// so the 4 MB framebuffer lives in DRAM (it cannot fit on-chip — see
-// fpga/kv260/README.md §3). This file defines the INTERFACE only; the datapath
-// (async R/W FIFOs for the voodoo-clk <-> HP-UI-clk crossing, AXI burst issue,
-// 2-byte WSTRB sub-word writes, tagged read responses) is M7 work.
+// Single PL clock (ACLK == voodoo clk == HP-port clock => NO CDC, per README §4).
+// Single outstanding transaction (req_ready drops while busy): correct and in-order
+// by construction. fb_arb already tolerates arbitrary read latency + back-pressure
+// (proven by `make test-fblat`), so this works functionally; MULTI-OUTSTANDING and
+// an async-FIFO CDC (if the HP port runs faster than the fabric) are perf follow-ons.
 //
-// IMPORTANT — this adapter is useless without the paired fb_arb.sv rewrite:
-//   fb_ram presents a FIXED 1-cycle read latency with no backpressure; DDR is
-//   variable-latency. fb_arb.sv (rtl/) must be rewritten to a multi-entry tag
-//   FIFO that (a) makes cN_req_ready = "cmd FIFO not full", (b) drives cN_rsp_valid
-//   from the ACTUAL AXI read-response return, (c) keeps responses in order (single
-//   ARID). The pixel_pipe / lfb_unit / fastfill clients already advance on rsp_valid,
-//   so their FSMs are unchanged. Gate the whole change on `make test` staying
-//   byte-identical to gold using a latency-injecting fb stub BEFORE wiring real DDR.
+// Verification status: lint/elaboration-clean. Functional sign-off needs a Vivado
+// AXI-VIP / DDR-model simulation (no DDR model in the Verilator flow). The fb-side
+// behaviour it must match is already covered by test-fblat.
 //
-// FB byte address of word W = FB_BASE_BYTES + W*2 (off-by-2x corrupts the image;
-// scan_front_base is a 16-bit WORD offset).
+// 16-bit subword on a 32-bit AXI data bus via a NARROW transfer (A?SIZE=1, 2 bytes):
+//   byte_addr = FB_BASE_BYTES + (word << 1)   (off-by-2x corrupts the image)
+//   write: WDATA = {2{wdata}}, WSTRB = byte_addr[1] ? 4'b1100 : 4'b0011
+//   read : rdata = byte_addr[1] ? RDATA[31:16] : RDATA[15:0]
 `default_nettype none
 
 module fb_ddr_adapter
   import voodoo_pkg::*;
 #(
-    parameter int          AXI_DATA_W      = 64,           // S_AXI_HP data width
-    parameter logic [31:0] FB_BASE_BYTES   = 32'h7000_0000 // DDR fb region base
+    parameter int          AXI_AW        = 49,            // S_AXI_HP address width
+    parameter logic [48:0] FB_BASE_BYTES = 49'h7000_0000  // DDR fb region base (byte)
 ) (
-    // ---- voodoo clock domain (fb_ram replacement port; see fb_arb rewrite) ----
     input  wire logic              clk,
     input  wire logic              rst_n,
-    input  wire logic              we,         // 16-bit subword write
-    input  wire logic [FB_AW-1:0]  addr,       // word address
-    input  wire logic [15:0]       wdata,
-    output wire logic [15:0]       rdata,       // valid 1 tag later (see rd_valid)
-    output wire logic              rd_valid,    // tagged read-data valid (NEW vs fb_ram)
 
-    // ---- AXI4 master to PS DDR (S_AXI_HP0_FPD), HP UI clock domain ----
-    input  wire logic              axi_aclk,
-    input  wire logic              axi_aresetn,
-    output wire logic [48:0]       m_axi_awaddr,
+    // ---- fb_arb RAM-side handshake (== voodoo_top fb memory port) ----
+    input  wire logic              req_valid,
+    output wire logic              req_ready,
+    input  wire logic              we,
+    input  wire logic [FB_AW-1:0]  addr,
+    input  wire logic [15:0]       wdata,
+    output wire logic              rd_valid,
+    output wire logic [15:0]       rdata,
+
+    // ---- AXI4 master to PS DDR (S_AXI_HP*), 32-bit data ----
+    output wire logic [AXI_AW-1:0] m_axi_awaddr,
     output wire logic [7:0]        m_axi_awlen,
+    output wire logic [2:0]        m_axi_awsize,
+    output wire logic [1:0]        m_axi_awburst,
     output wire logic              m_axi_awvalid,
     input  wire logic              m_axi_awready,
-    output wire logic [AXI_DATA_W-1:0]   m_axi_wdata,
-    output wire logic [AXI_DATA_W/8-1:0] m_axi_wstrb,
+    output wire logic [31:0]       m_axi_wdata,
+    output wire logic [3:0]        m_axi_wstrb,
     output wire logic              m_axi_wlast,
     output wire logic              m_axi_wvalid,
     input  wire logic              m_axi_wready,
     input  wire logic [1:0]        m_axi_bresp,
     input  wire logic              m_axi_bvalid,
     output wire logic              m_axi_bready,
-    output wire logic [48:0]       m_axi_araddr,
+    output wire logic [AXI_AW-1:0] m_axi_araddr,
     output wire logic [7:0]        m_axi_arlen,
+    output wire logic [2:0]        m_axi_arsize,
+    output wire logic [1:0]        m_axi_arburst,
     output wire logic              m_axi_arvalid,
     input  wire logic              m_axi_arready,
-    input  wire logic [AXI_DATA_W-1:0]   m_axi_rdata,
+    input  wire logic [31:0]       m_axi_rdata,
     input  wire logic [1:0]        m_axi_rresp,
     input  wire logic              m_axi_rlast,
     input  wire logic              m_axi_rvalid,
     output wire logic              m_axi_rready
 );
-  // ====================== SKELETON BODY (M7 TODO) ======================
-  // Drive the AXI master idle and return zero so the module elaborates and
-  // lints. Replace with: write-combining buffer + AXI write burst issue
-  // (2-byte WSTRB), read-command async FIFO (clk->axi_aclk), read-data async
-  // FIFO (axi_aclk->clk) returning {tag,data}, and rd_valid from the data FIFO.
-  assign m_axi_awaddr  = '0;
-  assign m_axi_awlen   = '0;
-  assign m_axi_awvalid = 1'b0;
-  assign m_axi_wdata   = '0;
-  assign m_axi_wstrb   = '0;
-  assign m_axi_wlast   = 1'b0;
-  assign m_axi_wvalid  = 1'b0;
-  assign m_axi_bready  = 1'b1;
-  assign m_axi_araddr  = '0;
-  assign m_axi_arlen   = '0;
-  assign m_axi_arvalid = 1'b0;
-  assign m_axi_rready  = 1'b1;
-  assign rdata         = 16'h0;
-  assign rd_valid      = 1'b0;
+  typedef enum logic [2:0] { S_IDLE, S_AW, S_W, S_B, S_AR, S_R } state_e;
+  state_e             st;
+  logic [AXI_AW-1:0]  baddr_q;       // latched byte address
+  logic [15:0]        wdata_q;
+  logic               rd_valid_q;
+  logic [15:0]        rdata_q;
 
-  // tie-off until the datapath is implemented
-  wire _unused = &{1'b0, clk, rst_n, we, addr, wdata, axi_aclk, axi_aresetn,
-                   m_axi_awready, m_axi_wready, m_axi_bresp, m_axi_bvalid,
-                   m_axi_arready, m_axi_rdata, m_axi_rresp, m_axi_rlast, m_axi_rvalid,
-                   FB_BASE_BYTES};
+  wire [AXI_AW-1:0] byte_addr = FB_BASE_BYTES + {{(AXI_AW-FB_AW-1){1'b0}}, addr, 1'b0}; // base + word*2
+
+  assign req_ready = (st == S_IDLE);
+
+  // address/control (held from the latched request)
+  assign m_axi_awaddr  = baddr_q;
+  assign m_axi_araddr  = baddr_q;
+  assign m_axi_awlen   = 8'd0;       // single beat
+  assign m_axi_arlen   = 8'd0;
+  assign m_axi_awsize  = 3'd1;       // 2 bytes (narrow)
+  assign m_axi_arsize  = 3'd1;
+  assign m_axi_awburst = 2'b01;      // INCR
+  assign m_axi_arburst = 2'b01;
+  assign m_axi_awvalid = (st == S_AW);
+  assign m_axi_arvalid = (st == S_AR);
+  assign m_axi_wdata   = {2{wdata_q}};                       // subword on both lanes
+  assign m_axi_wstrb   = baddr_q[1] ? 4'b1100 : 4'b0011;     // select the 2 active bytes
+  assign m_axi_wlast   = 1'b1;
+  assign m_axi_wvalid  = (st == S_W);
+  assign m_axi_bready  = (st == S_B);
+  assign m_axi_rready  = (st == S_R);
+
+  assign rd_valid = rd_valid_q;
+  assign rdata    = rdata_q;
+
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      st <= S_IDLE; baddr_q <= '0; wdata_q <= '0;
+      rd_valid_q <= 1'b0; rdata_q <= '0;
+    end else begin
+      rd_valid_q <= 1'b0;                       // 1-cycle pulse
+      unique case (st)
+        S_IDLE: if (req_valid) begin
+          baddr_q <= byte_addr; wdata_q <= wdata;
+          st <= we ? S_AW : S_AR;
+        end
+        S_AW: if (m_axi_awvalid & m_axi_awready) st <= S_W;   // AW accepted -> W
+        S_W:  if (m_axi_wvalid  & m_axi_wready ) st <= S_B;   // W accepted  -> B
+        S_B:  if (m_axi_bvalid) st <= S_IDLE;
+        S_AR: if (m_axi_arvalid & m_axi_arready) st <= S_R;
+        S_R: if (m_axi_rvalid) begin
+          rdata_q    <= baddr_q[1] ? m_axi_rdata[31:16] : m_axi_rdata[15:0];
+          rd_valid_q <= 1'b1;
+          st         <= S_IDLE;
+        end
+        default: st <= S_IDLE;
+      endcase
+    end
+  end
+
+  // tie-off: B/R response codes are not surfaced (an error path would need a
+  // status register); single-beat so rlast is implied.
+  wire _unused = &{1'b0, m_axi_bresp, m_axi_rresp, m_axi_rlast};
+
 endmodule
 
 `default_nettype wire

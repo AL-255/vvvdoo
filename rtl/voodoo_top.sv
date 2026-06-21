@@ -31,6 +31,35 @@ module voodoo_top
     output logic [10:0]      scan_rowpixels,
     output logic [9:0]       scan_width,
     output logic [9:0]       scan_height
+`ifdef VOODOO_FB_DDR
+    // KV260 board: framebuffer in PS DDR4 via an AXI4 master (-> PS S_AXI_HP).
+    // (Leading commas so the default/sim port list is byte-for-byte unchanged.)
+    , output logic [48:0] m_axi_fb_awaddr
+    , output logic [7:0]  m_axi_fb_awlen
+    , output logic [2:0]  m_axi_fb_awsize
+    , output logic [1:0]  m_axi_fb_awburst
+    , output logic        m_axi_fb_awvalid
+    , input  logic        m_axi_fb_awready
+    , output logic [31:0] m_axi_fb_wdata
+    , output logic [3:0]  m_axi_fb_wstrb
+    , output logic        m_axi_fb_wlast
+    , output logic        m_axi_fb_wvalid
+    , input  logic        m_axi_fb_wready
+    , input  logic [1:0]  m_axi_fb_bresp
+    , input  logic        m_axi_fb_bvalid
+    , output logic        m_axi_fb_bready
+    , output logic [48:0] m_axi_fb_araddr
+    , output logic [7:0]  m_axi_fb_arlen
+    , output logic [2:0]  m_axi_fb_arsize
+    , output logic [1:0]  m_axi_fb_arburst
+    , output logic        m_axi_fb_arvalid
+    , input  logic        m_axi_fb_arready
+    , input  logic [31:0] m_axi_fb_rdata
+    , input  logic [1:0]  m_axi_fb_rresp
+    , input  logic        m_axi_fb_rlast
+    , input  logic        m_axi_fb_rvalid
+    , output logic        m_axi_fb_rready
+`endif
 );
 
   // ----------------------------------------------------------------
@@ -135,8 +164,10 @@ module voodoo_top
   logic [FB_AW-1:0]  c2_req_addr;
   logic [15:0]       c2_req_wdata, c2_rsp_rdata;
 
-  // fb_ram / tex_ram
-  logic              ram_we;
+  // fb_ram / tex_ram. The fb memory port is a valid/ready handshake with a
+  // separate read-data-valid so fb_arb drives either the on-chip 1-cycle fb_ram
+  // (here) or the variable-latency PS-DDR4 adapter on the KV260 board.
+  logic              ram_req_valid, ram_req_ready, ram_we, ram_rd_valid;
   logic [FB_AW-1:0]  ram_addr;
   logic [15:0]       ram_wdata, ram_rdata;
   logic              t_req_valid, t_req_we;
@@ -632,19 +663,126 @@ module voodoo_top
       .c2_req_wdata (c2_req_wdata),
       .c2_rsp_valid (c2_rsp_valid),
       .c2_rsp_rdata (c2_rsp_rdata),
-      .ram_we       (ram_we),
-      .ram_addr     (ram_addr),
-      .ram_wdata    (ram_wdata),
-      .ram_rdata    (ram_rdata)
+      .ram_req_valid (ram_req_valid),
+      .ram_req_ready (ram_req_ready),
+      .ram_we        (ram_we),
+      .ram_addr      (ram_addr),
+      .ram_wdata     (ram_wdata),
+      .ram_rd_valid  (ram_rd_valid),
+      .ram_rdata     (ram_rdata)
   );
 
+`ifdef VOODOO_FB_DDR
+  // ---- KV260 BOARD: framebuffer in PS DDR4 (no on-chip fb_ram) ----
+  // fb_ddr_adapter masters PS S_AXI_HP; its handshake matches fb_arb's RAM port.
+  // Verified functionally by `make test-fbddr` (adapter + behavioral AXI memory).
+  fb_ddr_adapter #(.AXI_AW(49), .FB_BASE_BYTES(49'h7000_0000)) u_fbddr (
+      .clk(clk), .rst_n(rst_n),
+      .req_valid(ram_req_valid), .req_ready(ram_req_ready), .we(ram_we),
+      .addr(ram_addr), .wdata(ram_wdata), .rd_valid(ram_rd_valid), .rdata(ram_rdata),
+      .m_axi_awaddr(m_axi_fb_awaddr), .m_axi_awlen(m_axi_fb_awlen), .m_axi_awsize(m_axi_fb_awsize),
+      .m_axi_awburst(m_axi_fb_awburst), .m_axi_awvalid(m_axi_fb_awvalid), .m_axi_awready(m_axi_fb_awready),
+      .m_axi_wdata(m_axi_fb_wdata), .m_axi_wstrb(m_axi_fb_wstrb), .m_axi_wlast(m_axi_fb_wlast),
+      .m_axi_wvalid(m_axi_fb_wvalid), .m_axi_wready(m_axi_fb_wready),
+      .m_axi_bresp(m_axi_fb_bresp), .m_axi_bvalid(m_axi_fb_bvalid), .m_axi_bready(m_axi_fb_bready),
+      .m_axi_araddr(m_axi_fb_araddr), .m_axi_arlen(m_axi_fb_arlen), .m_axi_arsize(m_axi_fb_arsize),
+      .m_axi_arburst(m_axi_fb_arburst), .m_axi_arvalid(m_axi_fb_arvalid), .m_axi_arready(m_axi_fb_arready),
+      .m_axi_rdata(m_axi_fb_rdata), .m_axi_rresp(m_axi_fb_rresp), .m_axi_rlast(m_axi_fb_rlast),
+      .m_axi_rvalid(m_axi_fb_rvalid), .m_axi_rready(m_axi_fb_rready));
+`else
+  // u_fb_ram stays a direct child of voodoo_top (the trace-diff TB zero-fills
+  // voodoo_top.u_fb_ram.mem by hierarchical path). The handshake glue around it
+  // selects the memory-port behaviour; fb_ram's we/addr/wdata are muxed per build.
+  logic [15:0]      fbram_rdata_raw, fbram_wdata;
+  logic [FB_AW-1:0] fbram_addr;
+  logic             fbram_we;
   fb_ram u_fb_ram (
       .clk   (clk),
-      .we    (ram_we),
-      .addr  (ram_addr),
-      .wdata (ram_wdata),
-      .rdata (ram_rdata)
+      .we    (fbram_we),
+      .addr  (fbram_addr),
+      .wdata (fbram_wdata),
+      .rdata (fbram_rdata_raw)
   );
+
+`ifdef FB_DDR_SIM
+  // SIM-ONLY: verify fb_ddr_adapter end-to-end. fb_arb -> fb_ddr_adapter (the real
+  // AXI4 master) -> axi_mem_sim (behavioral AXI slave) -> fb_ram. Byte-identical
+  // frames prove the adapter's AXI FSM, narrow-transfer addressing and lane muxing.
+  // Build with `make test-fbddr`. NEVER synthesized.
+  localparam int FBA = 49;
+  logic [FBA-1:0] aw_a, ar_a;  logic [7:0] aw_l, ar_l;  logic [2:0] aw_s, ar_s;
+  logic [1:0] aw_b, ar_b, b_r, r_r;
+  logic aw_v, aw_rdy, w_v, w_rdy, w_l, b_v, b_rdy, ar_v, ar_rdy, r_v, r_rdy, r_l;
+  logic [31:0] w_d, r_d;  logic [3:0] w_st;
+  fb_ddr_adapter #(.AXI_AW(FBA), .FB_BASE_BYTES(49'd0)) u_fbddr (
+      .clk(clk), .rst_n(rst_n),
+      .req_valid(ram_req_valid), .req_ready(ram_req_ready), .we(ram_we),
+      .addr(ram_addr), .wdata(ram_wdata), .rd_valid(ram_rd_valid), .rdata(ram_rdata),
+      .m_axi_awaddr(aw_a), .m_axi_awlen(aw_l), .m_axi_awsize(aw_s), .m_axi_awburst(aw_b),
+      .m_axi_awvalid(aw_v), .m_axi_awready(aw_rdy),
+      .m_axi_wdata(w_d), .m_axi_wstrb(w_st), .m_axi_wlast(w_l), .m_axi_wvalid(w_v), .m_axi_wready(w_rdy),
+      .m_axi_bresp(b_r), .m_axi_bvalid(b_v), .m_axi_bready(b_rdy),
+      .m_axi_araddr(ar_a), .m_axi_arlen(ar_l), .m_axi_arsize(ar_s), .m_axi_arburst(ar_b),
+      .m_axi_arvalid(ar_v), .m_axi_arready(ar_rdy),
+      .m_axi_rdata(r_d), .m_axi_rresp(r_r), .m_axi_rlast(r_l), .m_axi_rvalid(r_v), .m_axi_rready(r_rdy));
+  axi_mem_sim #(.AXI_AW(FBA)) u_axi_mem (
+      .clk(clk), .rst_n(rst_n),
+      .awaddr(aw_a), .awlen(aw_l), .awsize(aw_s), .awburst(aw_b), .awvalid(aw_v), .awready(aw_rdy),
+      .wdata(w_d), .wstrb(w_st), .wlast(w_l), .wvalid(w_v), .wready(w_rdy),
+      .bresp(b_r), .bvalid(b_v), .bready(b_rdy),
+      .araddr(ar_a), .arlen(ar_l), .arsize(ar_s), .arburst(ar_b), .arvalid(ar_v), .arready(ar_rdy),
+      .rdata(r_d), .rresp(r_r), .rlast(r_l), .rvalid(r_v), .rready(r_rdy),
+      .mem_we(fbram_we), .mem_addr(fbram_addr), .mem_wdata(fbram_wdata), .mem_rdata(fbram_rdata_raw));
+`elsif FB_LAT_INJECT
+  assign fbram_addr  = ram_addr;
+  assign fbram_wdata = ram_wdata;
+  // SIM-ONLY DDR-readiness check: model a variable-latency, back-pressured memory
+  // port (deterministic) and confirm the fb_arb tag FIFO + the lfb/fastfill/pixel
+  // clients still produce byte-identical frames. Read responses are delayed in
+  // program order by FB_RD_LAT cycles; req_ready drops 1 in 4 cycles. Build with
+  // `make test-fblat`. NEVER synthesized (the board uses fb_ddr_adapter).
+  // FB_RD_LAT > fb_arb TAG_DEPTH(16) so the tag-FIFO-full read backpressure path
+  // is exercised (up to 20 responses in flight > 16 trackable -> ram_req_valid
+  // must gate reads until a response retires).
+  localparam int unsigned FB_RD_LAT = 20;
+  logic [1:0] fbli_bp;
+  always_ff @(posedge clk) fbli_bp <= !rst_n ? 2'd0 : fbli_bp + 2'd1;
+  assign ram_req_ready = (fbli_bp != 2'b00);          // ready 3 of every 4 cycles
+  wire   fbli_fire     = ram_req_valid & ram_req_ready;
+  assign fbram_we      = fbli_fire & ram_we;          // write only when accepted
+
+  // in-order {valid,data} delay line: dl[0] captures the read's data the cycle
+  // fb_ram presents it (accept+1); dl[FB_RD_LAT] is the delivered response.
+  logic         fbli_acc_rd;                          // read accepted last cycle
+  logic         dl_v [0:FB_RD_LAT];
+  logic [15:0]  dl_d [0:FB_RD_LAT];
+  always_ff @(posedge clk) begin
+    if (!rst_n) begin
+      fbli_acc_rd <= 1'b0;
+      for (int k = 0; k <= FB_RD_LAT; k++) begin dl_v[k] <= 1'b0; dl_d[k] <= 16'h0; end
+    end else begin
+      fbli_acc_rd <= fbli_fire & ~ram_we;
+      dl_v[0] <= fbli_acc_rd;  dl_d[0] <= fbram_rdata_raw;
+      for (int k = 1; k <= FB_RD_LAT; k++) begin dl_v[k] <= dl_v[k-1]; dl_d[k] <= dl_d[k-1]; end
+    end
+  end
+  assign ram_rd_valid = dl_v[FB_RD_LAT];
+  assign ram_rdata    = dl_d[FB_RD_LAT];
+`else
+  // on-chip 1-cycle fb_ram as the handshake port: always ready, read data one cycle
+  // later -> fb_arb's tag FIFO behaves identically to the legacy 1-deep pipe
+  // (make test = PIXEL-EXACT). The KV260 board build swaps in fb_ddr_adapter.
+  assign fbram_addr    = ram_addr;
+  assign fbram_wdata   = ram_wdata;
+  assign ram_req_ready = 1'b1;
+  assign fbram_we      = ram_req_valid & ram_we;
+  assign ram_rdata     = fbram_rdata_raw;
+  always_ff @(posedge clk) begin
+    if (!rst_n) ram_rd_valid <= 1'b0;
+    else        ram_rd_valid <= ram_req_valid & ~ram_we;   // read accepted -> data next cycle
+  end
+`endif
+`endif // VOODOO_FB_DDR
 
   tex_ram u_tex_ram (
       .clk     (clk),

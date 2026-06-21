@@ -23,19 +23,24 @@ set FIT_ONLY [expr {[info exists ::env(FIT_ONLY)] ? $::env(FIT_ONLY) : 0}]
 create_project voodoo_kv260 $ROOT/fpga/kv260/build_kv260 -part $PART -force
 set_property board_part $BOARD [current_project]
 
-# core RTL (voodoo_pkg first) + the KV260 wrappers
+# core RTL (voodoo_pkg first) + the board IP (NOT fb_ram_stub.sv/axi_mem_sim.sv:
+# those are sim-only and fb_ram_stub redefines fb_ram). fb_ram is unused under
+# VOODOO_FB_DDR (framebuffer is in PS DDR4).
 read_verilog -sv $ROOT/rtl/voodoo_pkg.sv
 read_verilog -sv [glob $ROOT/rtl/*.sv]
-read_verilog -sv [glob $ROOT/fpga/kv260/rtl/*.sv]
-# integer backend + reduced on-chip texture; force URAM for the RAMs
-set_property verilog_define [list VOODOO_INT TEX_AW=$TEXAW] [current_fileset]
+read_verilog -sv $ROOT/fpga/kv260/rtl/axi_voodoo_slave.sv
+read_verilog -sv $ROOT/fpga/kv260/rtl/fb_ddr_adapter.sv
+read_verilog -sv $ROOT/fpga/kv260/rtl/voodoo_pl_top.sv
+# integer backend + framebuffer->DDR + reduced on-chip texture (URAM)
+set_property verilog_define [list VOODOO_INT VOODOO_FB_DDR VOODOO_TEX_AW=$TEXAW] [current_fileset]
 
-# -------- synth-only fit/inference GATE (README §6 step 1) --------
+# -------- synth-only PL fit (== `make kv260-pl-fit`) --------
 if {$FIT_ONLY} {
-  synth_design -top voodoo_top -part $PART -mode out_of_context \
-               -verilog_define VOODOO_INT -verilog_define TEX_AW=$TEXAW
-  report_utilization -file $ROOT/fpga/reports/kv260_fit_util.rpt
-  puts "FIT_ONLY done -> fpga/reports/kv260_fit_util.rpt (check URAM <= 64, no BRAM cascade)"
+  synth_design -top voodoo_pl_top -part $PART -mode out_of_context \
+               -verilog_define VOODOO_INT -verilog_define VOODOO_FB_DDR \
+               -verilog_define VOODOO_TEX_AW=$TEXAW
+  report_utilization -file $ROOT/fpga/reports/kv260_pl_util.rpt
+  puts "FIT_ONLY done -> fpga/reports/kv260_pl_util.rpt"
   return
 }
 
@@ -60,16 +65,15 @@ create_bd_cell -type ip -vlnv xilinx.com:ip:proc_sys_reset rstgen
 create_bd_cell -type ip -vlnv xilinx.com:ip:smartconnect sc
 set_property -dict [list CONFIG.NUM_SI {1} CONFIG.NUM_MI {2}] [get_bd_cells sc]
 
-# 5) the RTL cells (module references; AXI ifaces inferred from port naming)
-create_bd_cell -type module -reference axi_voodoo_slave slave
-create_bd_cell -type module -reference voodoo_top       core
-create_bd_cell -type module -reference fb_ddr_adapter   fbddr
+# 5) the PL user IP — ONE cell (module reference; AXI ifaces inferred from the
+#    s_bar_*/s_stat_*/m_axi_fb_* port naming).
+create_bd_cell -type module -reference voodoo_pl_top voodoo
 
 # --- clocking/reset: ONE clock everywhere (no host-port CDC); timed sync reset ---
-# wire clkw.clk_out1 -> all ACLKs + core.clk; rstgen.peripheral_aresetn -> all *RESETN + core.rst_n
+# wire clkw.clk_out1 -> all ACLKs + voodoo.clk; rstgen.peripheral_aresetn -> all *RESETN + voodoo.rst_n
 # wire ps PL_CLK0 -> clkw.clk_in1, ps maxihpm0/saxihp0 aclk <- clkw.clk_out1
-# wire slave.host_* <-> core host_*; core fb master <-> fbddr; fbddr.M_AXI -> ps.S_AXI_HP0
-# (explicit connect_bd_net/connect_bd_intf_net lines elided here — fill per README §4;
+# wire sc.M00 -> voodoo.S_AXI_BAR, sc.M01 -> voodoo.S_AXI_STAT; voodoo.M_AXI_FB -> ps.S_AXI_HP0
+# (explicit connect_bd_intf_net lines elided here — fill per README §4;
 #  validate_bd_design must report NO axi_clock_converter inserted.)
 
 # 6) address map: BAR @0x8000_0000 / 16M, STAT @0x8001_0000 / 64K; fbddr sees PS DDR.

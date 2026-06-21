@@ -4,9 +4,16 @@
 /* verilator lint_off UNUSEDPARAM */
 package voodoo_pkg;
 
-  // memory geometry: 4 MB framebuffer (2^21 x 16), 2 MB texture (2^20 x 16)
+  // memory geometry: 4 MB framebuffer (2^21 x 16), 2 MB texture (2^20 x 16).
+  // TEX_AW is overridable (+define+VOODOO_TEX_AW=NN) for FPGA targets whose on-chip
+  // URAM cannot hold the full 2 MB texture (e.g. KV260/xck26 uses 17 = 128K x16 =
+  // 32 URAM). Default 20 keeps `make test` at the full gold geometry, unchanged.
   localparam int unsigned FB_AW  = 21;
+`ifdef VOODOO_TEX_AW
+  localparam int unsigned TEX_AW = `VOODOO_TEX_AW;
+`else
   localparam int unsigned TEX_AW = 20;
+`endif
 
   // ---------------------------------------------------------------
   // register word indices (byte offset / 4) — SST-1, per voodoo_render.h

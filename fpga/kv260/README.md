@@ -13,19 +13,74 @@ so it can never disturb the `make test` gate — that flow globs only `rtl/*.sv`
 
 | File | State |
 |---|---|
-| `fpga/kv260/rtl/axi_voodoo_slave.sv` | **done** — synthesizable AXI4 slave + AXI4-Lite STAT sideband, all verified protocol fixes; **Verilator-lint-clean** (`make kv260-lint`). |
-| `fpga/kv260/rtl/fb_ddr_adapter.sv` | **skeleton** — interface defined, datapath is M7 (needs the `fb_arb` rewrite). |
+| `rtl/fb_arb.sv` | **done + verified** — rewritten to a valid/ready RAM port + tag FIFO for variable-latency, in-order responses. Byte-identical to the legacy 1-deep pipe (`make test` PIXEL-EXACT). |
+| `fpga/kv260/rtl/fb_ddr_adapter.sv` | **done + verified** — single-outstanding AXI4 master (16-bit subword = 2-byte narrow transfer). Functionally verified end-to-end (`make test-fbddr`, byte-identical). Multi-outstanding/CDC = perf follow-on. |
+| `fpga/kv260/rtl/axi_mem_sim.sv` | **done** — sim-only behavioral AXI slave to verify the adapter in Verilator (no Vivado). |
+| `fpga/kv260/rtl/axi_voodoo_slave.sv` | **done** — synthesizable AXI4 slave + AXI4-Lite STAT sideband, all verified protocol fixes. |
+| `fpga/kv260/rtl/voodoo_pl_top.sv` | **done** — the single PL IP for the BD: `axi_voodoo_slave` + board `voodoo_top` + `fb_ddr_adapter`. Lint-clean (`make kv260-lint`); **synthesizes on `xck26`** (`make kv260-pl-fit`). |
 | `cosim/voodoo_hw.cpp` | **done (skeleton)** — `VOODOO_BACKEND=hw` backend over `/dev/mem`; **compiles** against `voodoo_render.h`. |
-| `fpga/kv260/bd_voodoo.tcl` | recipe — full BD + a `FIT_ONLY=1` synth-only fit gate. |
+| `rtl/voodoo_pkg.sv`, `rtl/tex_ram.sv` | **done** — `VOODOO_TEX_AW` override + `ram_style="ultra"` (texture -> URAM). |
+| `fpga/kv260/bd_voodoo.tcl`, `fit_check.tcl` | recipes — full BD + the synth-only fit gate (`make kv260-fit`). |
 | `fpga/kv260/voodoo_kv260.xdc` | done — timed synchronous reset (no false-path), 50 MHz. |
-| `fpga/kv260/voodoo.dts`, `shell.json`, `Makefile.frag` | done — overlay + dfx metadata + `kv260-*` build targets. |
+| `fpga/kv260/voodoo.dts`, `shell.json`, `Makefile.frag` | done — overlay + dfx metadata + `kv260-*`/`test-fblat`/`test-fbddr` targets. |
 
-Ground-truth fit (Vivado 2025.2 OOC, `xck26-sfvc784-2LV-c`, integer backend + SRT
-divider, RAMs black-boxed): **LUT 28.0% / FF 9.5% / DSP 18.4% / BRAM 0 / URAM 0** —
-the datapath fits with large headroom; memory placement (below) is the real work.
+### Verified milestones (all in the Verilator gold flow — no Vivado needed)
 
-Remaining engineering is the numbered checklist in §6 (next: the `fb_arb` rewrite +
-`fb_ddr_adapter` datapath, then the Vivado BD).
+1. **Fit/inference GATE** (`make kv260-fit`, Vivado OOC on `xck26-2LV`): datapath fits
+   (**FF 9.5% / DSP 18.4%**) and texture at `TEX_AW=17` infers **exactly 32 URAM, 0 BRAM
+   cascade** — confirming `ram_style="ultra"` and leaving 32 URAM + 144 BRAM for FIFOs.
+2. **`fb_arb` rewrite** — `make test` stays **PIXEL-EXACT and cycle-identical** (the
+   handshake/tag-FIFO path is behaviour-preserving with the 1-cycle RAM).
+3. **DDR-readiness** (`make test-fblat`) — with a variable-latency, back-pressured fb
+   port (read latency 20 > the 16-deep tag FIFO, so the full-FIFO backpressure path is
+   exercised), all five frames stay **byte-identical** at higher cycle counts. Proves
+   the arbiter + lfb/fastfill/pixel clients tolerate PS-DDR4 latency.
+4. **`fb_ddr_adapter` end-to-end** (`make test-fbddr`) — the real AXI4 master driving a
+   behavioral AXI memory produces **byte-identical** frames (verifies the AXI FSM,
+   narrow-transfer addressing and lane muxing).
+5. **Board PL fit** (`make kv260-pl-fit`, Vivado OOC on `xck26`): the complete PL IP
+   `voodoo_pl_top` (AXI slave + integer core + SRT divider + `fb_ddr_adapter`, texture
+   in URAM, FB to external DDR) synthesizes and **fits** —
+   **LUT 32,891 (28.1%) / FF 22,460 (9.6%) / URAM 32 (50%) / BRAM 0 / DSP 229 (18.4%)**.
+
+The `voodoo_top` board variant (`VOODOO_FB_DDR`, exposing the AXI-HP fb master) and the
+`voodoo_pl_top` BD IP are **done and synthesize**. Remaining (needs the full Vivado BD
+run / the board): assemble the block design (`bd_voodoo.tcl` — PS + clk_wiz +
+SmartConnect wiring), implement to a bitstream, and the boot/overlay + GLQuake bring-up
+— checklist §6 steps 4 (BD assembly) through 12.
+
+### Device view — full OOC synth → place → route (`make kv260-impl`)
+
+A full out-of-context implementation of `voodoo_pl_top` on `xck26-sfvc784-2LV-c` at the
+50 MHz bring-up clock **routes clean and meets timing with margin** (WNS **+3.05 ns**,
+≈ **59 MHz** achievable). Post-route fabric:
+
+| LUT | FF | CARRY8 | DSP | URAM | BRAM |
+|--:|--:|--:|--:|--:|--:|
+| 32,042 (27 %) | 22,389 (10 %) | 1,539 (11 %) | 229 (18 %) | 32 (50 %) | 0 |
+
+Placed cells from the routed checkpoint, colored by RTL hierarchy
+(`make kv260-view`; SLICE Y0 at the bottom, like the Vivado device window):
+
+![KV260 device view, colored by RTL hierarchy](device_view.png)
+
+| Color | Module | SLICE cells |
+|---|---|--:|
+| 🔴 red | `raster` — edge coverage + the **3 SRT slope dividers** | 20,107 |
+| 🟢 green | `tmu` — texture mapping + the **2 perspective SRT dividers** | 13,267 |
+| 🟤 brown | `voodoo_regfile` — register file + fog table | 12,645 |
+| 🟡 olive | `host_if` — 64-deep command FIFO | 7,744 |
+| 🔷 teal | `cmd_dispatch` | 3,913 |
+| 🔵 blue | `pixel_pipe` | 3,132 |
+| 🟣 purple | `axi_voodoo_slave` — the AXI host bridge | 1,750 |
+| 🟠 orange | `fb_ddr_adapter` — framebuffer AXI→PS-DDR4 | 128 |
+| — | `lfb_unit` / `fastfill` / `tex_dl` / `fb_arb` / glue | < 600 each |
+
+The five SRT dividers (`raster` red + `tmu` green) dominate the fabric — exactly the
+arithmetic the integer backend added; everything else is small. `fb_ddr_adapter` (orange)
+and `fb_arb`'s tag FIFO (cyan) are tiny. Texture is 32 URAM (the 50 % URAM column);
+the framebuffer is off-chip in PS DDR4 (no BRAM). Reproduce: `make kv260-impl` then
+`make kv260-view`.
 
 ---
 
@@ -157,9 +212,9 @@ Pin the mmap memory type: use UIO (`generic-uio`, Device memory) as the correct 
 
 ## 6. Bring-up checklist (RTL wrapper → running GLQuake)
 
-1. **(GATE) Fit + inference check.** Synth-only run on `xck26-sfvc784-2LV-c` with `TEX_AW=17`, `(* ram_style="ultra" *)` on `tex_ram`, fb_ram replaced by the DDR adapter stub. Confirm: texture fits ≤ 64 URAM **and** infers true-dual-port byte-write URAM (no BRAM cascade). If not, drop to `TEX_AW=16` or move texture to DDR too. Boot/clk planning is wasted if memory is infeasible.
-2. **Write `fpga/kv260/rtl/axi_voodoo_slave.sv`** (S_AXI_BAR AXI4 + S_AXI_STAT AXI4-Lite). Bench against a SystemVerilog testbench replaying `voodoo_rtl.cpp` traffic; verify the AXI-protocol fixes (latched RDATA/held RVALID, AR-gate on wrapper R-beat retirement, AWSIZE!=2 → SLVERR, INCR-only burst, single B terminator).
-3. **Write `fpga/kv260/rtl/fb_ddr_adapter.sv` + rewrite `rtl/fb_arb.sv`** for variable AXI read latency. Co-sim the rewritten arbiter against the existing Verilator gold (`make test`) using a latency-injecting fb stub to prove `pixel_pipe`/`lfb_unit`/`fastfill` tolerate stalls and out-of-order-tolerant tagging. **`make test` is the gate — RTL must stay byte-identical to gold.**
+1. ✅ **(GATE) Fit + inference check** — DONE (`make kv260-fit`): texture infers 32 URAM, 0 BRAM cascade; datapath fits (FF 9.5% / DSP 18.4%). `VOODOO_TEX_AW=17` + `(* ram_style="ultra" *)` in place.
+2. ✅ **`fpga/kv260/rtl/axi_voodoo_slave.sv`** — DONE (Verilator-lint-clean, all AXI-protocol fixes). A dedicated replay testbench is a follow-on; the AXI loop is exercised via the adapter test below.
+3. ✅ **`fb_ddr_adapter.sv` + `fb_arb.sv` rewrite** — DONE & VERIFIED. `make test` PIXEL-EXACT (arbiter behaviour-preserving); `make test-fblat` byte-identical under latency 20 + backpressure (DDR-tolerance, tag-FIFO-full path); `make test-fbddr` byte-identical through the real adapter + behavioral AXI memory. `make test` stays the gate — all byte-identical to gold.
 4. **Build the Vivado BD** (`fpga/kv260/bd_voodoo.tcl`): Zynq US+ PS (board preset, M_AXI_HPM0_LPD enabled, S_AXI_HP0_FPD enabled for DDR fb, pl_clk0=100MHz, pl_resetn0), clk_wiz→50MHz, proc_sys_reset, SmartConnect (single clock), `axi_voodoo_slave` + `voodoo_top` RTL cells, `fb_ddr_adapter` → HP0. Assign S_AXI_BAR @ `0x8000_0000`/16M, S_AXI_STAT @ `0x8001_0000`/64K. `validate_bd_design`; confirm no clock converter inserted.
 5. **Implement** to `write_bitstream` with the fresh `voodoo_kv260.xdc` (timed reset, create_clock auto from clk_wiz). Run place+route and confirm 50 MHz closes with margin before raising the clock. Output `voodoo_bd_wrapper.bit`.
 6. **Package**: `voodoo.bit.bin` (header-stripped), `voodoo.dtbo` (`&fpga_full { firmware-name="voodoo.bit.bin"; }` + `generic-uio` nodes for BAR @0x80000000/16M and STAT @0x80010000/64K under the overlay's fpga-region), `shell.json` (`{"shell_type":"XRT_FLAT","num_slots":"1"}`). Stage in `/lib/firmware/xilinx/vvvdoo/`.

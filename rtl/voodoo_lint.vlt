@@ -7,7 +7,7 @@
 // those lines of that one file; it cannot mask warnings anywhere else.
 // NOTE for integrator: the Makefile lint/sim targets glob only rtl/*.sv, so
 // this file must be added there (or 2 inline lint_off pragmas in the pkg).
-lint_off -rule UNUSEDSIGNAL -file "*voodoo_pkg.sv" -lines 144-163
+lint_off -rule UNUSEDSIGNAL -file "*voodoo_pkg.sv" -lines 154-173
 
 // JUSTIFICATION: the M4 fog-table read is a combinational lookup — pixel_pipe's
 // always_comb derives fog_rd_idx from the pixel depth, the regfile returns

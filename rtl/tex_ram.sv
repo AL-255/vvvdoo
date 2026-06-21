@@ -15,6 +15,9 @@ module tex_ram
 
   localparam int unsigned DEPTH = 1 << TEX_AW;
 
+  // ram_style="ultra": map to UltraRAM on FPGA targets (KV260: TEX_AW=17 -> 32 URAM,
+  // true-dual-port byte-write). Ignored by Verilator, so sim is unaffected.
+  (* ram_style = "ultra" *)
   logic [15:0] mem [0:DEPTH-1] /* verilator public_flat_rw */;
 
   always_ff @(posedge clk) begin

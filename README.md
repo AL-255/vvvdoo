@@ -23,7 +23,7 @@ stream through the RTL — no software rasterizer in the pixel path.*
 | **M3** | TMU: textures (perspective, LOD/mip, point/bilinear, all formats) | ✅ pixel-exact |
 | **M4** | Full pixel pipeline: fog, chroma-key, stipple, alpha/depth, blend | ✅ pixel-exact |
 | **M5** | QEMU RTL-C co-simulation (system test) | ✅ runs GLQuake |
-| **M6** | FPGA synth/impl (ZU15EG): integer backend + SRT divider, 85 MHz | 🟡 OOC done |
+| **M6** | FPGA: ZU15EG OOC (85 MHz) · KV260 PL routed (50 MHz, FB→DDR4, texture→URAM) | 🟡 P&R done; board bring-up WIP |
 | **M7** | Pipelining / fill-rate (post-GLQuake) | ⏳ |
 
 `make test` is the gate — it is currently **all PIXEL-EXACT** (RTL frame CRC ==
@@ -128,6 +128,24 @@ vectors (`make srt-test`) and byte-identical rendered frames — lifting Fmax
 **6.1×** and moving the bottleneck off the divider onto the TMU LOD-base math.
 Reproduce with `make fpga`; details in
 [`fpga/reports/ZU15EG-REPORT.md`](fpga/reports/ZU15EG-REPORT.md).
+
+## Board deployment (KV260)
+
+The integer backend is being brought up on a **Xilinx Kria KV260** (`xck26`): an x86
+emulator on the PS Arm cores drives the Voodoo RTL in the PL over AXI, with the
+framebuffer in PS DDR4 and texture in URAM. The full PL IP (`voodoo_pl_top` = AXI host
+bridge + integer core + SRT dividers + DDR framebuffer adapter) **synthesizes, places
+and routes** on `xck26-2LV` and **meets timing at 50 MHz** (WNS +3.05 ns). Device view
+of the routed design, colored by RTL hierarchy:
+
+![KV260 routed device view, colored by hierarchy](fpga/kv260/device_view.png)
+
+*Red = `raster` (edge coverage + 3 SRT slope dividers), green = `tmu` (+ 2 perspective
+SRT dividers), brown = `voodoo_regfile`, olive = `host_if` FIFO, blue = `pixel_pipe`,
+purple = the AXI host bridge, orange = the DDR framebuffer adapter. The memory
+architecture (FB→DDR4, texture→URAM) is verified byte-identical to gold in the Verilator
+flow (`make test-fblat` / `test-fbddr`). Details + bring-up checklist:
+[`fpga/kv260/README.md`](fpga/kv260/README.md).*
 
 ## Repository layout
 

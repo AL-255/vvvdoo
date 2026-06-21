@@ -6,17 +6,34 @@
 VOODOO_INC := $(abspath vvvdoo-refs/06-qemu-voodoo/src)
 KV260_RTL  := $(wildcard fpga/kv260/rtl/*.sv)
 
-.PHONY: kv260-lint kv260-fit kv260-bit kv260-pkg kv260-install cosim-lib-hw
+.PHONY: kv260-lint kv260-fit kv260-pl-fit kv260-impl kv260-view kv260-bit kv260-pkg kv260-install cosim-lib-hw
 
-# lint the board wrappers standalone (does not touch the core make lint)
+# lint the WHOLE board PL IP (axi_voodoo_slave + board voodoo_top + fb_ddr_adapter)
+# in its real config; does not touch the core `make lint`.
 kv260-lint:
-	$(VERILATOR) --lint-only -Wall --top-module axi_voodoo_slave \
-	  rtl/voodoo_pkg.sv rtl/voodoo_lint.vlt fpga/kv260/rtl/axi_voodoo_slave.sv
+	$(VERILATOR) --lint-only -Wall --top-module voodoo_pl_top \
+	  +define+VOODOO_INT +define+VOODOO_FB_DDR +define+VOODOO_TEX_AW=17 \
+	  rtl/voodoo_lint.vlt rtl/voodoo_pkg.sv $(filter-out rtl/voodoo_pkg.sv,$(wildcard rtl/*.sv)) \
+	  fpga/kv260/rtl/axi_voodoo_slave.sv fpga/kv260/rtl/fb_ddr_adapter.sv fpga/kv260/rtl/voodoo_pl_top.sv
 
-# README §6 step-1 GATE: synth-only fit/inference check on xck26 (TEX_AW reduced)
+# texture URAM-inference GATE (README §6 step 1): synth-only, reduced texture
 kv260-fit:
-	FIT_ONLY=1 vivado -mode batch -source fpga/kv260/bd_voodoo.tcl
+	vivado -mode batch -source fpga/kv260/fit_check.tcl
 	@echo "see fpga/reports/kv260_fit_util.rpt (URAM <= 64, no BRAM cascade)"
+
+# REAL board fabric fit: OOC synth of the full PL IP (voodoo_pl_top) on xck26
+kv260-pl-fit:
+	vivado -mode batch -source fpga/kv260/synth_pl_top.tcl
+	@echo "see fpga/reports/kv260_pl_util.rpt"
+
+# full OOC implementation (synth -> place -> route) + placement dump for the view
+kv260-impl:
+	vivado -mode batch -source fpga/kv260/impl_pl_top.tcl
+	@echo "see fpga/reports/kv260_impl_{util,timing}.rpt + kv260_placement.txt"
+
+# render the hierarchy-colored device view PNG from the placement dump (pure python)
+kv260-view:
+	python3 fpga/kv260/plot_device.py fpga/reports/kv260_placement.txt fpga/kv260/device_view.png
 
 # build the block design + bitstream (needs the M7 RTL — see bd_voodoo.tcl header)
 kv260-bit:
